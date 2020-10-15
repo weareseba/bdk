@@ -1181,7 +1181,11 @@ where
 mod test {
     use std::str::FromStr;
 
-    use bitcoin::Network;
+    use bitcoin::{
+        consensus::deserialize,
+        util::psbt::{serialize::Serialize, PartiallySignedTransaction},
+        Network,
+    };
 
     use crate::database::memory::MemoryDatabase;
     use crate::database::Database;
@@ -2466,5 +2470,43 @@ mod test {
 
         let extracted = signed_psbt.extract_tx();
         assert_eq!(extracted.input[0].witness.len(), 2);
+    }
+
+    /// replicating a 3 0f 7 p2wsh p2sh wallet from electrum
+    #[test]
+    fn test_sign_multi_p2wsh_p2sh() {
+        let pubkeys = vec![
+            "020e1e9e13a2c6178c0e3cba7f6a6bb18c5363e74f35b7572a620ae72b90685680",
+            "02264f891c836d99272164b962e511a017e1a1b835d5f30bdc8691c42634e59351",
+            "02e0bbf72ffa17d4c0654515c8541df02958c3ef82bc09a825c1c55aa8a892afbb",
+            "031f26b9d6ac186f65ef0a1b093371e99e8e17aa6d3636f7634920479df5ae5a77",
+            "031f5bd798116f9701794da6904ca0d26d06e24ba920785e48671c91c35dad756e",
+            "036eb794bc2b512233ec9fc8cd60e2e4ba31eb1f49796cb380ecd9898147a9ca86",
+            "03a0e5c6c0212cf6d0c60867b9107d461c5e5790b032f6a5d33b3319332f1d9130",
+        ];
+        let priv_key = "KxUXnwf3w7y7L7bQYk8ZyUrjKacTHpZKRdo71HnnsFs2Rbwe95QZ";
+        let desc = format!(
+            "sh(wsh(multi(3,{},{},{},{},{},{},{})))",
+            pubkeys[0], priv_key, pubkeys[2], pubkeys[3], pubkeys[4], pubkeys[5], pubkeys[6]
+        );
+        let wallet: OfflineWallet<_> =
+            Wallet::new_offline(&desc, None, Network::Bitcoin, MemoryDatabase::default()).unwrap();
+
+        assert_eq!(
+            "325g8XuPdyYav4bZK8k4dA62hQpExMQT6C",
+            wallet.get_new_address().unwrap().to_string()
+        );
+
+        let unsigned_tx = "0200000001bbc8d87eba45f99fa950c4cb513f23c07b0941e1f9058a4d1fcb52c98595c2ec0100000000000000000210270000000000001976a914bda5fbf75d67de006aa4768970113ca8a1d0727688acec7700000000000017a91404490b65f9dc2e67dbb3e5f4d7835d4582fcc4d98700000000";
+        let psbt = hex::decode(unsigned_tx).unwrap();
+        let psbt = deserialize(&psbt).unwrap();
+        let psbt = PartiallySignedTransaction::from_unsigned_tx(psbt).unwrap();
+
+        let (signed_psbt, finalized) = wallet.sign(psbt, None).unwrap();
+        assert_eq!(finalized, false);
+        assert_ne!(
+            hex::encode(signed_psbt.extract_tx().serialize()),
+            unsigned_tx
+        );
     }
 }
