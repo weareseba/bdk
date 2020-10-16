@@ -2472,6 +2472,8 @@ mod test {
         assert_eq!(extracted.input[0].witness.len(), 2);
     }
 
+    use crate::bitcoin::consensus::{Encodable, Decodable};
+
     /// replicating a 3 0f 7 p2wsh p2sh wallet from electrum
     #[test]
     fn test_sign_multi_p2wsh_p2sh() {
@@ -2484,10 +2486,10 @@ mod test {
             "036eb794bc2b512233ec9fc8cd60e2e4ba31eb1f49796cb380ecd9898147a9ca86",
             "03a0e5c6c0212cf6d0c60867b9107d461c5e5790b032f6a5d33b3319332f1d9130",
         ];
-        let priv_key = "KxUXnwf3w7y7L7bQYk8ZyUrjKacTHpZKRdo71HnnsFs2Rbwe95QZ";
+        let priv_key = "Kwjn2GAHZxvMUTzSMAsCAo1Eksm38iBFAUwqvbS5dz4QxbyAqeCT";
         let desc = format!(
             "sh(wsh(multi(3,{},{},{},{},{},{},{})))",
-            pubkeys[0], priv_key, pubkeys[2], pubkeys[3], pubkeys[4], pubkeys[5], pubkeys[6]
+            pubkeys[0], pubkeys[1], priv_key, pubkeys[3], pubkeys[4], pubkeys[5], pubkeys[6]
         );
         let wallet: OfflineWallet<_> =
             Wallet::new_offline(&desc, None, Network::Bitcoin, MemoryDatabase::default()).unwrap();
@@ -2497,16 +2499,20 @@ mod test {
             wallet.get_new_address().unwrap().to_string()
         );
 
-        let unsigned_tx = "0200000001bbc8d87eba45f99fa950c4cb513f23c07b0941e1f9058a4d1fcb52c98595c2ec0100000000000000000210270000000000001976a914bda5fbf75d67de006aa4768970113ca8a1d0727688acec7700000000000017a91404490b65f9dc2e67dbb3e5f4d7835d4582fcc4d98700000000";
-        let psbt = hex::decode(unsigned_tx).unwrap();
-        let psbt = deserialize(&psbt).unwrap();
-        let psbt = PartiallySignedTransaction::from_unsigned_tx(psbt).unwrap();
+        let electrum_tx = "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";
+        let psbt = base64::decode(electrum_tx).unwrap();
+        let mut psbt = PartiallySignedTransaction::consensus_decode(&psbt[..]).unwrap();
+        assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
+        psbt.inputs[0].sighash_type = Some(SigHashType::All);
 
         let (signed_psbt, finalized) = wallet.sign(psbt, None).unwrap();
+
         assert_eq!(finalized, false);
-        assert_ne!(
-            hex::encode(signed_psbt.extract_tx().serialize()),
-            unsigned_tx
-        );
+        assert_eq!(signed_psbt.inputs[0].partial_sigs.len(), 2);
+
+        let mut encoded = Vec::<u8>::new();
+        signed_psbt.consensus_encode(&mut encoded).unwrap();
+        let encoded = base64::encode(&encoded);
+        assert_ne!(encoded, electrum_tx);
     }
 }
