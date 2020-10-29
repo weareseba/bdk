@@ -8,10 +8,12 @@ authors = ["Alekos Filini <alekos.filini@gmail.com>", "Riccardo Casatta <riccard
 bdk-macros = { version = "0.1.0-beta.1", path = "./macros" }
 log = "^0.4"
 bitcoin = { version = "0.25", features = ["use-serde"] }
+bitcoin_hashes = "^0.9"
 miniscript = { git = "https://github.com/MagicalBitcoin/rust-miniscript", rev = "dfc53201aa5796b6bf3b5a40581d192abaa84133" }
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 rand = "^0.7"
+base64 = "^0.11"
 
 # Optional dependencies
 sled = { version = "0.34", optional = true }
@@ -19,7 +21,7 @@ electrum-client = { version = "0.3.0-beta.1", optional = true }
 reqwest = { version = "0.10", optional = true, features = ["json"] }
 futures = { version = "0.3", optional = true }
 clap = { version = "2.33", optional = true }
-base64 = { version = "^0.11", optional = true }
+#base64 = { version = "^0.11", optional = true }
 async-trait = { version = "0.1", optional = true }
 rocksdb = { version = "0.14", optional = true }
 socks = { version = "0.3", optional = true }
@@ -43,7 +45,8 @@ electrum = ["electrum-client"]
 esplora = ["reqwest", "futures"]
 compact_filters = ["rocksdb", "socks", "lazy_static"]
 key-value-db = ["sled"]
-cli-utils = ["clap", "base64"]
+#cli-utils = ["clap", "base64"]
+cli-utils = ["clap"]
 async-interface = ["async-trait"]
 all-keys = ["keys-bip39"]
 keys-bip39 = ["tiny-bip39"]
@@ -51,7 +54,7 @@ keys-bip39 = ["tiny-bip39"]
 # Debug/Test features
 debug-proc-macros = ["bdk-macros/debug", "bdk-testutils-macros/debug"]
 test-electrum = ["electrum"]
-test-md-docs = ["base64", "electrum"]
+test-md-docs = ["electrum"]
 
 [dev-dependencies]
 bdk-testutils = { version = "0.1.0-beta.1", path = "./testutils" }

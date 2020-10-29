@@ -45,6 +45,7 @@ use log::{debug, error, info, trace};
 pub mod address_validator;
 pub mod coin_selection;
 pub mod export;
+pub mod reserves;
 pub mod signer;
 pub mod time;
 pub mod tx_builder;
