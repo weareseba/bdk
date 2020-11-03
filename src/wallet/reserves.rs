@@ -25,14 +25,15 @@
 use std::str::FromStr;
 
 use bitcoin::blockdata::{
-    script::Script,
-    transaction::{OutPoint, Transaction, TxIn},
+    opcodes,
+    script::{Builder, Script},
+    transaction::{OutPoint, Transaction, TxIn, TxOut},
 };
 use bitcoin::consensus::encode::Decodable;
-use bitcoin::hash_types::Txid;
-use bitcoin::util::psbt::PartiallySignedTransaction as PSBT;
+use bitcoin::hash_types::{PubkeyHash, Txid};
+use bitcoin::util::psbt::{Input, PartiallySignedTransaction as PSBT};
 
-use bitcoin_hashes::{sha256d, Hash};
+use bitcoin_hashes::{Hash, sha256d};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -63,29 +64,103 @@ where
     fn do_create_proof(&self, message: &str) -> Result<PSBT, Error> {
         let message = "Proof-of-Reserves: ".to_string() + message;
         let message = sha256d::Hash::hash(message.as_bytes());
-        let commitment = TxIn {
+        let challenge_txin = TxIn {
             previous_output: OutPoint::new(Txid::from_hash(message), 0),
-            script_sig: Script::new(),
-            sequence: 0,
+            sequence: 0xFFFFFFFF,
+		    script_sig: Builder::new().into_script(),
             witness: Vec::new(),
         };
+        let challenge_psbt_inp = Input {
+			witness_utxo: Some(TxOut {
+				value: 0,
+				script_pubkey: Builder::new().push_opcode(opcodes::OP_TRUE).into_script(),
+			}),
+			witness_script: Some(Builder::new().into_script()),
+			final_script_sig: Some(Builder::new().into_script()),
+			..Default::default()
+		};
+
+        let mut tx_inputs = Vec::new();
+        let mut psbt_inputs = Vec::new();
+        tx_inputs.push(challenge_txin);
+        psbt_inputs.push(challenge_psbt_inp);
+
+//        let client = self.client.as_ref().ok_or(Error::OfflineClient)?;
+//        let utxos = client.script_list_unspent(addr.script_pubkey())?;
+        let utxos = self.database.borrow().iter_utxos()?;
+
+//        if let Some(wallet) = self.downcast_ref::<Wallet>();
+//        let utxos = self.script_list_unspent();
+
+        let mut sum_amount = 0;
+        for utxo in utxos {
+            let proof_txin = TxIn{
+                previous_output: utxo.outpoint,
+                sequence: 0xFFFFFFFF,
+                script_sig: Builder::new().into_script(),
+                witness: Vec::new(),
+            };
+            let proof_psbt_inp = Input{
+                // ToDo: unsure about the next few lines
+                witness_utxo: Some(TxOut {
+                    value: 0,
+                    script_pubkey: Builder::new().push_opcode(opcodes::OP_TRUE).into_script(),
+                }),
+                witness_script: Some(Builder::new().into_script()),
+                final_script_sig: Some(Builder::new().into_script()),
+                ..Default::default()
+            };
+            tx_inputs.push(proof_txin);
+            psbt_inputs.push(proof_psbt_inp);
+            sum_amount += utxo.txout.value;
+        }
+
+		let pkh = match PubkeyHash::from_slice(&[0]) {
+            Ok(pkh) => pkh,
+            Err(e) => return Err(Error::Generic(format!("Error hashing address: {:?}", e))),
+        };
+		let out_script_unspendable = bitcoin::Address {
+			payload: bitcoin::util::address::Payload::PubkeyHash(pkh),
+			network: bitcoin::Network::Testnet,
+		}.script_pubkey();
+
+		// Construct the tx and psbt tx.
+		let tx = Transaction {
+			version: 1,
+			lock_time: 0xffffffff, // Max time in the future. 2106-02-07 06:28:15
+			input: tx_inputs,
+			output: vec![TxOut {
+				value: sum_amount as u64,
+				script_pubkey: out_script_unspendable,
+			}],
+		};
+		let mut psbt = PSBT::from_unsigned_tx(tx)
+			.expect("error constructing PSBT from unsigned tx");
+        psbt.inputs = psbt_inputs;
+        // We can leave the one psbt output empty.
+        
+
+/*
         let tx = Transaction {
             version: 1,
             lock_time: 0,
-            input: vec![commitment],
+            input: vec![challenge_txin],
             output: Vec::new(),
         };
         let mut psbt = PSBT::from_unsigned_tx(tx)?;
+*/
 
+/*
         let addr = self.get_new_address()?;
-        let (psbt2, _) = self
+        let (psbt, _) = self
             .create_tx(
                 TxBuilder::with_recipients(vec![(addr.script_pubkey(), 0)])
                     .send_all()
                     .fee_absolute(0),
             )
             .unwrap();
-        psbt.merge(psbt2)?;
+*/
+//        psbt.merge(psbt2)?;
 
         Ok(psbt)
     }
@@ -94,6 +169,7 @@ where
 #[cfg(test)]
 mod test {
     use bitcoin::{Network, Txid};
+    use rstest::rstest;
 
     use super::*;
     use crate::database::{memory::MemoryDatabase, BatchOperations};
@@ -118,28 +194,6 @@ mod test {
 
         db
     }
-
-    /// Make sure this is a proof, and not a spendable transaction
-    fn ensure_is_proof(psbt: &PSBT, message: &str) -> Result<(), Error> {
-
-        Ok(())
-    }
-
-/*
-    pub(crate) fn get_test_wpkh() -> &'static str {
-        "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"
-    }
-
-    pub(crate) fn get_test_single_sig_csv() -> &'static str {
-        // and(pk(Alice),older(6))
-        "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),older(6)))"
-    }
-
-    pub(crate) fn get_test_single_sig_cltv() -> &'static str {
-        // and(pk(Alice),after(100000))
-        "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))"
-    }
-*/
 
     pub(crate) fn get_funded_wallet(
         descriptor: &str,
@@ -168,9 +222,43 @@ mod test {
         (wallet, descriptors, txid)
     }
 
-    #[test]
-    fn test_proof_funded() {
-        let descriptor = "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)";
+    pub(crate) fn get_test_xprv() -> &'static str {
+        "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)"
+    }
+
+    pub(crate) fn get_test_wpkh() -> &'static str {
+        "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"
+    }
+
+    pub(crate) fn get_test_single_sig_csv() -> &'static str {
+        // and(pk(Alice),older(6))
+        "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),older(6)))"
+    }
+
+    pub(crate) fn get_test_single_sig_cltv() -> &'static str {
+        // and(pk(Alice),after(100000))
+        "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))"
+    }
+
+    /// Make sure this is a proof, and not a spendable transaction
+    fn ensure_is_proof(psbt: &PSBT, message: &str) -> Result<(), Error> {
+        let message = "Proof-of-Reserves: ".to_string() + message;
+        let message = sha256d::Hash::hash(message.as_bytes());
+        let fake_txid = Txid::from_hash(message);
+
+        let tx = psbt.clone().extract_tx();
+        assert_eq!(tx.input[0].previous_output.txid, fake_txid);
+
+        Ok(())
+    }
+
+    #[rstest(descriptor,
+        case(get_test_xprv()),
+        case(get_test_wpkh()),
+        case(get_test_single_sig_csv()),
+        case(get_test_single_sig_cltv())
+    )]
+    fn test_proof(descriptor: &'static str) {
         let (wallet, _, _) = get_funded_wallet(descriptor, Network::Bitcoin);
 
         let message = "Everything belongs to me because I am poor.";

@@ -64,6 +64,7 @@ lazy_static = "1.4"
 rustyline = "6.0"
 dirs = "2.0"
 env_logger = "0.7"
+rstest = "0.6.4"
 
 [[example]]
 name = "repl"
