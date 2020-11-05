@@ -31,9 +31,10 @@ use bitcoin::blockdata::{
 };
 use bitcoin::consensus::encode::Decodable;
 use bitcoin::hash_types::{PubkeyHash, Txid};
-use bitcoin::util::psbt::{Input, PartiallySignedTransaction as PSBT};
+use bitcoin::util::psbt::{self, Input, PartiallySignedTransaction as PSBT};
+use bitcoin::util::address::Payload;
 
-use bitcoin_hashes::{Hash, sha256d};
+use bitcoin_hashes::{Hash, hash160, sha256d};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -41,7 +42,7 @@ use log::{debug, error, info, trace};
 use super::tx_builder::TxBuilder;
 
 use crate::blockchain::BlockchainMarker;
-use crate::database::BatchDatabase;
+use crate::database::{BatchDatabase, DatabaseUtils};
 use crate::error::Error;
 use crate::wallet::Wallet;
 
@@ -49,11 +50,20 @@ use crate::wallet::Wallet;
 /// https://github.com/bitcoin/bips/blob/master/bip-0127.mediawiki
 /// https://github.com/bitcoin/bips/blob/master/bip-0322.mediawiki
 pub trait ProofOfReserves {
+    /// Create a proof for all spendable UTXOs in a wallet
     fn create_proof(&self, message: &str) -> Result<PSBT, Error> {
         self.do_create_proof(message)
     }
+    /// Make sure this is a proof, and not a spendable transaction.
+    /// Returns the spendable amount of the proof.
+    fn verify_proof(&self, psbt: &PSBT, message: &str) -> Result<u64, Error> {
+        return self.do_verify_proof(psbt, message)
+    }
 
     fn do_create_proof(&self, message: &str) -> Result<PSBT, Error>;
+    fn do_verify_proof(&self, psbt: &PSBT, message: &str) -> Result<u64, Error>;
+    // ToDo: how can we remove this helper function from the trait definition, but keep in the implementation?
+    fn get_spendable_value_from_input(&self, pinp: &psbt::Input,) -> Result<u64, Error>;
 }
 
 impl<B, D> ProofOfReserves for Wallet<B, D>
@@ -85,13 +95,7 @@ where
         tx_inputs.push(challenge_txin);
         psbt_inputs.push(challenge_psbt_inp);
 
-//        let client = self.client.as_ref().ok_or(Error::OfflineClient)?;
-//        let utxos = client.script_list_unspent(addr.script_pubkey())?;
         let utxos = self.database.borrow().iter_utxos()?;
-
-//        if let Some(wallet) = self.downcast_ref::<Wallet>();
-//        let utxos = self.script_list_unspent();
-
         let mut sum_amount = 0;
         for utxo in utxos {
             let proof_txin = TxIn{
@@ -115,13 +119,10 @@ where
             sum_amount += utxo.txout.value;
         }
 
-		let pkh = match PubkeyHash::from_slice(&[0]) {
-            Ok(pkh) => pkh,
-            Err(e) => return Err(Error::Generic(format!("Error hashing address: {:?}", e))),
-        };
+        let pkh = PubkeyHash::from_hash(hash160::Hash::hash(&[0]));
 		let out_script_unspendable = bitcoin::Address {
-			payload: bitcoin::util::address::Payload::PubkeyHash(pkh),
-			network: bitcoin::Network::Testnet,
+			payload: Payload::PubkeyHash(pkh),
+			network: self.network,
 		}.script_pubkey();
 
 		// Construct the tx and psbt tx.
@@ -138,33 +139,90 @@ where
 			.expect("error constructing PSBT from unsigned tx");
         psbt.inputs = psbt_inputs;
         // We can leave the one psbt output empty.
-        
-
-/*
-        let tx = Transaction {
-            version: 1,
-            lock_time: 0,
-            input: vec![challenge_txin],
-            output: Vec::new(),
-        };
-        let mut psbt = PSBT::from_unsigned_tx(tx)?;
-*/
-
-/*
-        let addr = self.get_new_address()?;
-        let (psbt, _) = self
-            .create_tx(
-                TxBuilder::with_recipients(vec![(addr.script_pubkey(), 0)])
-                    .send_all()
-                    .fee_absolute(0),
-            )
-            .unwrap();
-*/
-//        psbt.merge(psbt2)?;
 
         Ok(psbt)
     }
+
+    fn do_verify_proof(&self, psbt: &PSBT, message: &str) -> Result<u64, Error> {
+        let tx = psbt.clone().extract_tx();
+
+        // verify the challenge txin
+        let message = "Proof-of-Reserves: ".to_string() + message;
+        let message = sha256d::Hash::hash(message.as_bytes());
+        let fake_txid = Txid::from_hash(message);
+        assert_eq!(tx.input[0].previous_output.txid, fake_txid);
+
+        // verify the proof UTXOs
+        let mut sum = 0;
+        for inp in psbt.inputs.iter().skip(1) {
+            sum += self.get_spendable_value_from_input(inp)?;
+            // ToDo: verify the signature
+        }
+
+        // verify the unspendable output
+        assert_eq!(tx.output.len(), 1);
+        let pkh = PubkeyHash::from_hash(hash160::Hash::hash(&[0]));
+		let out_script_unspendable = bitcoin::Address {
+			payload: Payload::PubkeyHash(pkh),
+			network: self.network,
+		}.script_pubkey();
+        assert_eq!(tx.output[0].script_pubkey, out_script_unspendable);
+
+        Ok(sum)
+    }
+
+    /// Calculate the spendable value from an input
+    // ToDo: some refactoring needed
+    fn get_spendable_value_from_input(&self,
+        pinp: &psbt::Input,
+    ) -> Result<u64, Error> {
+        if pinp.witness_utxo.is_some() {
+            return Ok(pinp.witness_utxo.as_ref().unwrap().value);
+        };
+        if pinp.non_witness_utxo.is_some() {
+            let mut err1: std::result::Result<(), Error> = Ok(());
+            let mut err2: std::result::Result<(), Error> = Ok(());
+            let value = pinp
+                .non_witness_utxo
+                .as_ref()
+                .unwrap()
+                .output
+                .iter()
+                .map(|txout| {
+                    match bitcoin::Address::from_script(&txout.script_pubkey, self.network) {
+                        Some(addr) => Ok((addr, txout.value)),
+                        None => Err(Error::Generic("no address".to_string()))
+                    }
+                })
+                .scan(&mut err1, |err1, res| match res {
+                    Ok(o) => Some(o),
+                    Err(e) => {
+                        **err1 = Err(e);
+                        None
+                    }
+                })
+                .map(|(prev_addr, value)| { 
+                    let is_mine = self.database.borrow().is_mine(&prev_addr.script_pubkey())?;
+                    Ok((is_mine, value))
+                })
+                .scan(&mut err2, |err2, res| match res {
+                    Ok(o) => Some(o),
+                    Err(e) => {
+                        **err2 = Err(e);
+                        None
+                    }
+                })
+                .filter(|(is_mine, value)| *is_mine)
+                .fold(0, |acc, (_prev_addr, value)| acc + value);
+            err1?;
+            err2?;
+            return Ok(value);
+        };
+
+        Ok(0)
+    }
 }
+
 
 #[cfg(test)]
 mod test {
@@ -240,17 +298,6 @@ mod test {
         "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))"
     }
 
-    /// Make sure this is a proof, and not a spendable transaction
-    fn ensure_is_proof(psbt: &PSBT, message: &str) -> Result<(), Error> {
-        let message = "Proof-of-Reserves: ".to_string() + message;
-        let message = sha256d::Hash::hash(message.as_bytes());
-        let fake_txid = Txid::from_hash(message);
-
-        let tx = psbt.clone().extract_tx();
-        assert_eq!(tx.input[0].previous_output.txid, fake_txid);
-
-        Ok(())
-    }
 
     #[rstest(descriptor,
         case(get_test_xprv()),
@@ -261,10 +308,15 @@ mod test {
     fn test_proof(descriptor: &'static str) {
         let (wallet, _, _) = get_funded_wallet(descriptor, Network::Bitcoin);
 
-        let message = "Everything belongs to me because I am poor.";
+        let message = "This belongs to me because I am poor.";
         let psbt = wallet.create_proof(&message).unwrap();
-        ensure_is_proof(&psbt, &message).unwrap();
+
+        let (signed_psbt, _finalized) = wallet.sign(psbt, None).unwrap();
+
+        let spendable = wallet.verify_proof(&signed_psbt, &message).unwrap();
+        assert_eq!(spendable, 0);
     }
+
 
 /*
     #[test]
