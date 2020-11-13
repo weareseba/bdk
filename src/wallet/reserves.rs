@@ -90,7 +90,7 @@ where
         tx_inputs.push(challenge_txin);
         psbt_inputs.push(challenge_psbt_inp);
 
-        let utxos = self.database.borrow().iter_utxos()?;
+        let utxos = self.list_unspent()?;
         let mut sum_amount = 0;
         for utxo in utxos {
             let proof_txin = TxIn {
@@ -152,6 +152,13 @@ where
         }
 
         // verify the proof UTXOs
+        let _utxos = self.list_unspent()?;
+/*
+        let _client = match self.client() {
+            Some(cli) => cli,
+            None => return Err(Error::CannotVerifyProof),
+        };
+*/
         let mut sum = 0;
         for inp in psbt.inputs.iter().skip(1) {
             sum += self.get_spendable_value_from_input(inp)?;
@@ -187,11 +194,14 @@ where
 
 #[cfg(test)]
 mod test {
-    use bitcoin::Network;
+    use bip39::{Mnemonic, MnemonicType, Language, Seed};
+    use bitcoin::{secp256k1::Secp256k1, Network, util::bip32::{ExtendedPubKey, ExtendedPrivKey}};
     use rstest::rstest;
 
     use super::*;
+    use crate::blockchain::{noop_progress, ElectrumBlockchain};
     use crate::database::memory::MemoryDatabase;
+    use crate::electrum_client::Client;
     use crate::wallet::OfflineWallet;
 
     pub(crate) fn get_funded_wallet(
@@ -243,13 +253,71 @@ mod test {
     )]
     fn test_proof(descriptor: &'static str) {
         let (wallet, _, _) = get_funded_wallet(descriptor, Network::Bitcoin);
+        let balance = wallet.get_balance().unwrap();
 
-        let message = "This belongs to me because I am poor.";
+        let message = "This belongs to me.";
         let psbt = wallet.create_proof(&message).unwrap();
 
         let (signed_psbt, _finalized) = wallet.sign(psbt, None).unwrap();
 
         let spendable = wallet.verify_proof(&signed_psbt, &message).unwrap();
-        assert_eq!(spendable, 50_000);
+        assert_eq!(spendable, balance);
+    }
+
+    fn mnemonic_to_xprv(words: &str) -> ExtendedPrivKey {
+        let mnemonic = Mnemonic::from_phrase(words, Language::English).unwrap();
+        let seed = Seed::new(&mnemonic, "");
+        ExtendedPrivKey::new_master(Network::Testnet, seed.as_bytes()).unwrap()
+    }
+
+    fn mnemonic_to_xpup(words: &str) -> ExtendedPubKey {
+        let xprv = mnemonic_to_xprv(words);
+        let secp = Secp256k1::new();
+        ExtendedPubKey::from_private(&secp, &xprv) 
+    }
+
+    fn construct_multisig_wallet(signer: &ExtendedPrivKey, cosigner1: &ExtendedPubKey, cosigner2: &ExtendedPubKey) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>, Error> {
+
+        let desc = "wsh(multi(2, ".to_string() + 
+                    &signer.to_string()    + "/1/*, " +
+                    &cosigner1.to_string() + "/1/*, " +
+                    &cosigner2.to_string() + "/1/*" +
+                    "))";
+
+        let client = Client::new("ssl://electrum.blockstream.info:60002", None)?;
+        let wallet = Wallet::new(
+            &desc,
+            None,
+            Network::Testnet,
+            MemoryDatabase::default(),
+            ElectrumBlockchain::from(client),
+        )?;
+
+        wallet.sync(noop_progress(), None)?;
+
+        Ok(wallet)
+    }
+
+    #[test]
+    fn test_proof_multisig() {
+        let signer1 = "lock prize genre deposit proof quarter tank clog bachelor ethics thumb impact";
+        let signer2 = "hour exchange cloud question alpha cover round brain novel luxury garment sense";
+        let signer3 = "gasp midnight road patch trigger upon stuff chase offer badge peace genuine";
+        let wallet1 = construct_multisig_wallet(&mnemonic_to_xprv(signer1), &mnemonic_to_xpup(signer2), &mnemonic_to_xpup(signer3)).unwrap();
+        let wallet2 = construct_multisig_wallet(&mnemonic_to_xprv(signer2), &mnemonic_to_xpup(signer1), &mnemonic_to_xpup(signer3)).unwrap();
+        let wallet3 = construct_multisig_wallet(&mnemonic_to_xprv(signer3), &mnemonic_to_xpup(signer1), &mnemonic_to_xpup(signer2)).unwrap();
+        let balance = wallet1.get_balance().unwrap();
+        let address = wallet1.get_new_address().unwrap();
+        assert_eq!(address.to_string(), "tb1qln88nw2tnr0e36wpda8gg0wrszjk0pzpfu5lmudsml7n8km7qrtq2ypc9x");
+        
+        let message = "All my precious coins";
+        let psbt = wallet1.create_proof(message).unwrap();
+
+        let (psbt, _finalized) = wallet1.sign(psbt, None).unwrap();
+        let (psbt, _finalized) = wallet2.sign(psbt, None).unwrap();
+        let (psbt, _finalized) = wallet3.sign(psbt, None).unwrap();
+
+        let spendable = wallet1.verify_proof(&psbt, &message).unwrap();
+        assert_eq!(spendable, balance);
     }
 }

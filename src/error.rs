@@ -51,6 +51,7 @@ pub enum Error {
         required: u64,
     },
     ProofOfReservesInvalid,
+    CannotVerifyProof,
 
     Key(crate::keys::KeyError),
 
