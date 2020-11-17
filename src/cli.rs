@@ -78,7 +78,13 @@ pub fn make_cli_subcommands<'a, 'b>() -> App<'a, 'b> {
         .subcommand(
             SubCommand::with_name("get_new_address").about("Generates a new external address"),
         )
-        .subcommand(SubCommand::with_name("sync").about("Syncs with the chosen Electrum server"))
+        .subcommand(SubCommand::with_name("sync").about("Syncs with the chosen Electrum server").arg(
+            Arg::with_name("max_addresses")
+                .required(false)
+                .takes_value(true)
+                .long("max_addresses")
+                .help("max addresses to consider"),
+        ))
         .subcommand(
             SubCommand::with_name("list_unspent").about("Lists the available spendable UTXOs"),
         )
@@ -143,10 +149,18 @@ pub fn make_cli_subcommands<'a, 'b>() -> App<'a, 'b> {
                         .takes_value(true),
                 )
                 .arg(
-                    Arg::with_name("policy")
-                        .long("policy")
+                    Arg::with_name("external_policy")
+                        .long("external_policy")
                         .value_name("POLICY")
-                        .help("Selects which policy should be used to satisfy the descriptor")
+                        .help("Selects which policy should be used to satisfy the external descriptor")
+                        .takes_value(true)
+                        .number_of_values(1),
+                )
+                .arg(
+                    Arg::with_name("internal_policy")
+                        .long("internal_policy")
+                        .value_name("POLICY")
+                        .help("Selects which policy should be used to satisfy the internal descriptor")
                         .takes_value(true)
                         .number_of_values(1),
                 ),
@@ -370,8 +384,11 @@ where
         Ok(json!({
             "address": wallet.get_new_address()?
         }))
-    } else if let Some(_sub_matches) = matches.subcommand_matches("sync") {
-        maybe_await!(wallet.sync(log_progress(), None))?;
+    } else if let Some(sub_matches) = matches.subcommand_matches("sync") {
+        let max_addresses: Option<u32> = sub_matches
+            .value_of("max_addresses")
+            .and_then(|m| m.parse().ok());
+        maybe_await!(wallet.sync(log_progress(), max_addresses))?;
         Ok(json!({}))
     } else if let Some(_sub_matches) = matches.subcommand_matches("list_unspent") {
         Ok(serde_json::to_value(&wallet.list_unspent()?)?)
@@ -388,11 +405,16 @@ where
             .map(|s| parse_recipient(s))
             .collect::<Result<Vec<_>, _>>()
             .map_err(Error::Generic)?;
-        let mut tx_builder = TxBuilder::with_recipients(recipients);
+        let mut tx_builder = TxBuilder::new();
 
         if sub_matches.is_present("send_all") {
-            tx_builder = tx_builder.send_all();
+            tx_builder = tx_builder
+                .drain_wallet()
+                .set_single_recipient(recipients[0].0.clone());
+        } else {
+            tx_builder = tx_builder.set_recipients(recipients);
         }
+
         if sub_matches.is_present("enable_rbf") {
             tx_builder = tx_builder.enable_rbf();
         }
@@ -416,10 +438,19 @@ where
                 .map_err(Error::Generic)?;
             tx_builder = tx_builder.unspendable(unspendable);
         }
-        if let Some(policy) = sub_matches.value_of("policy") {
+
+        let policies = vec![
+            sub_matches
+                .value_of("external_policy")
+                .map(|p| (p, ScriptType::External)),
+            sub_matches
+                .value_of("internal_policy")
+                .map(|p| (p, ScriptType::Internal)),
+        ];
+        for (policy, script_type) in policies.into_iter().filter_map(|x| x) {
             let policy = serde_json::from_str::<BTreeMap<String, Vec<usize>>>(&policy)
                 .map_err(|s| Error::Generic(s.to_string()))?;
-            tx_builder = tx_builder.policy_path(policy);
+            tx_builder = tx_builder.policy_path(policy, script_type);
         }
 
         let (psbt, details) = wallet.create_tx(tx_builder)?;
@@ -436,7 +467,7 @@ where
         let mut tx_builder = TxBuilder::new().fee_rate(FeeRate::from_sat_per_vb(fee_rate));
 
         if sub_matches.is_present("send_all") {
-            tx_builder = tx_builder.send_all();
+            tx_builder = tx_builder.maintain_single_recipient();
         }
 
         if let Some(utxos) = sub_matches.values_of("utxos") {

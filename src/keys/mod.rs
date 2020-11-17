@@ -29,6 +29,8 @@ use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::ops::Deref;
 
+use bitcoin::secp256k1;
+
 use bitcoin::util::bip32;
 use bitcoin::{Network, PrivateKey, PublicKey};
 
@@ -344,6 +346,11 @@ impl<K, Ctx: ScriptContext> GeneratedKey<K, Ctx> {
             phantom: PhantomData,
         }
     }
+
+    /// Consumes `self` and returns the key
+    pub fn into_key(self) -> K {
+        self.key
+    }
 }
 
 impl<K, Ctx: ScriptContext> Deref for GeneratedKey<K, Ctx> {
@@ -354,10 +361,12 @@ impl<K, Ctx: ScriptContext> Deref for GeneratedKey<K, Ctx> {
     }
 }
 
+// Make generated "derivable" keys themselves "derivable". Also make sure they are assigned the
+// right `valid_networks`.
 impl<Ctx, K> DerivableKey<Ctx> for GeneratedKey<K, Ctx>
 where
     Ctx: ScriptContext,
-    K: GeneratableKey<Ctx> + DerivableKey<Ctx>,
+    K: DerivableKey<Ctx>,
 {
     fn add_metadata(
         self,
@@ -369,12 +378,27 @@ where
     }
 }
 
+// Make generated keys directly usable in descriptors, and make sure they get assigned the right
+// `valid_networks`.
+impl<Ctx, K> ToDescriptorKey<Ctx> for GeneratedKey<K, Ctx>
+where
+    Ctx: ScriptContext,
+    K: ToDescriptorKey<Ctx>,
+{
+    fn to_descriptor_key(self) -> Result<DescriptorKey<Ctx>, KeyError> {
+        let desc_key = self.key.to_descriptor_key()?;
+        Ok(desc_key.override_valid_networks(self.valid_networks))
+    }
+}
+
 /// Trait for keys that can be generated
 ///
 /// The same rules about [`ScriptContext`] and [`ValidNetworks`] from [`ToDescriptorKey`] apply.
 ///
 /// This trait is particularly useful when combined with [`DerivableKey`]: if `Self`
-/// implements it, the returned [`GeneratedKey`] will also implement it.
+/// implements it, the returned [`GeneratedKey`] will also implement it. The same is true for
+/// [`ToDescriptorKey`]: the generated keys can be directly used in descriptors if `Self` is also
+/// [`ToDescriptorKey`].
 pub trait GeneratableKey<Ctx: ScriptContext>: Sized {
     /// Type specifying the amount of entropy required e.g. [u8;32]
     type Entropy: AsMut<[u8]> + Default;
@@ -400,6 +424,37 @@ pub trait GeneratableKey<Ctx: ScriptContext>: Sized {
     }
 }
 
+/// Trait that allows generating a key with the default options
+///
+/// This trait is automatically implemented if the [`GeneratableKey::Options`] implements [`Default`].
+pub trait GeneratableDefaultOptions<Ctx>: GeneratableKey<Ctx>
+where
+    Ctx: ScriptContext,
+    <Self as GeneratableKey<Ctx>>::Options: Default,
+{
+    /// Generate a key with the default options and a given entropy
+    fn generate_with_entropy_default(
+        entropy: Self::Entropy,
+    ) -> Result<GeneratedKey<Self, Ctx>, Self::Error> {
+        Self::generate_with_entropy(Default::default(), entropy)
+    }
+
+    /// Generate a key with the default options and a random entropy
+    fn generate_default() -> Result<GeneratedKey<Self, Ctx>, Self::Error> {
+        Self::generate(Default::default())
+    }
+}
+
+/// Automatic implementation of [`GeneratableDefaultOptions`] for [`GeneratableKey`]s where
+/// `Options` implements `Default`
+impl<Ctx, K> GeneratableDefaultOptions<Ctx> for K
+where
+    Ctx: ScriptContext,
+    K: GeneratableKey<Ctx>,
+    <K as GeneratableKey<Ctx>>::Options: Default,
+{
+}
+
 impl<Ctx: ScriptContext> GeneratableKey<Ctx> for bip32::ExtendedPrivKey {
     type Entropy = [u8; 32];
 
@@ -413,6 +468,42 @@ impl<Ctx: ScriptContext> GeneratableKey<Ctx> for bip32::ExtendedPrivKey {
         // pick a arbitrary network here, but say that we support all of them
         let xprv = bip32::ExtendedPrivKey::new_master(Network::Bitcoin, entropy.as_ref())?;
         Ok(GeneratedKey::new(xprv, any_network()))
+    }
+}
+
+/// Options for generating a [`PrivateKey`]
+///
+/// Defaults to creating compressed keys, which save on-chain bytes and fees
+#[derive(Debug, Copy, Clone)]
+pub struct PrivateKeyGenerateOptions {
+    pub compressed: bool,
+}
+
+impl Default for PrivateKeyGenerateOptions {
+    fn default() -> Self {
+        PrivateKeyGenerateOptions { compressed: true }
+    }
+}
+
+impl<Ctx: ScriptContext> GeneratableKey<Ctx> for PrivateKey {
+    type Entropy = [u8; secp256k1::constants::SECRET_KEY_SIZE];
+
+    type Options = PrivateKeyGenerateOptions;
+    type Error = bip32::Error;
+
+    fn generate_with_entropy(
+        options: Self::Options,
+        entropy: Self::Entropy,
+    ) -> Result<GeneratedKey<Self, Ctx>, Self::Error> {
+        // pick a arbitrary network here, but say that we support all of them
+        let key = secp256k1::SecretKey::from_slice(&entropy)?;
+        let private_key = PrivateKey {
+            compressed: options.compressed,
+            network: Network::Bitcoin,
+            key,
+        };
+
+        Ok(GeneratedKey::new(private_key, any_network()))
     }
 }
 
@@ -583,9 +674,21 @@ pub mod test {
     #[test]
     fn test_keys_generate_xprv() {
         let generated_xprv: GeneratedKey<_, miniscript::Segwitv0> =
-            bip32::ExtendedPrivKey::generate_with_entropy((), TEST_ENTROPY).unwrap();
+            bip32::ExtendedPrivKey::generate_with_entropy_default(TEST_ENTROPY).unwrap();
 
         assert_eq!(generated_xprv.valid_networks, any_network());
         assert_eq!(generated_xprv.to_string(), "xprv9s21ZrQH143K4Xr1cJyqTvuL2FWR8eicgY9boWqMBv8MDVUZ65AXHnzBrK1nyomu6wdcabRgmGTaAKawvhAno1V5FowGpTLVx3jxzE5uk3Q");
+    }
+
+    #[test]
+    fn test_keys_generate_wif() {
+        let generated_wif: GeneratedKey<_, miniscript::Segwitv0> =
+            bitcoin::PrivateKey::generate_with_entropy_default(TEST_ENTROPY).unwrap();
+
+        assert_eq!(generated_wif.valid_networks, any_network());
+        assert_eq!(
+            generated_wif.to_string(),
+            "L2wTu6hQrnDMiFNWA5na6jB12ErGQqtXwqpSL7aWquJaZG8Ai3ch"
+        );
     }
 }
