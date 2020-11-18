@@ -194,8 +194,11 @@ where
 
 #[cfg(test)]
 mod test {
-    use bitcoin::{secp256k1::Secp256k1, Network, util::key::{PrivateKey, PublicKey}};
-    use bitcoin_ypub::util::bip32::{DefaultResolver, DerivationPath, ExtendedPrivKey};
+    use bitcoin::{
+        secp256k1::Secp256k1,
+        util::key::{PrivateKey, PublicKey},
+        Network,
+    };
     use rstest::rstest;
 
     use super::*;
@@ -203,8 +206,6 @@ mod test {
     use crate::database::memory::MemoryDatabase;
     use crate::electrum_client::Client;
     use crate::wallet::OfflineWallet;
-    
-    use std::str::FromStr;
 
     pub(crate) fn get_funded_wallet(
         descriptor: &str,
@@ -228,30 +229,12 @@ mod test {
         (wallet, descriptors, txid)
     }
 
-    pub(crate) fn get_test_xprv() -> &'static str {
-        "wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)"
-    }
-
-    pub(crate) fn get_test_wpkh() -> &'static str {
-        "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"
-    }
-
-    pub(crate) fn get_test_single_sig_csv() -> &'static str {
-        // and(pk(Alice),older(6))
-        "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),older(6)))"
-    }
-
-    pub(crate) fn get_test_single_sig_cltv() -> &'static str {
-        // and(pk(Alice),after(100000))
-        "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))"
-    }
-
     #[rstest(
         descriptor,
-        case(get_test_xprv()),
-        case(get_test_wpkh()),
-        case(get_test_single_sig_csv()),
-        case(get_test_single_sig_cltv())
+        case("wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)"),
+        case("wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"),
+        case("wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),older(6)))"),     // and(pk(Alice),older(6))
+        case("wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))") // and(pk(Alice),after(100000))
     )]
     fn test_proof(descriptor: &'static str) {
         let (wallet, _, _) = get_funded_wallet(descriptor, Network::Bitcoin);
@@ -266,43 +249,39 @@ mod test {
         assert_eq!(spendable, balance);
     }
 
-    fn get_private_key(xprv: &str, derivation: &DerivationPath) -> PrivateKey {
-        let xprv = ExtendedPrivKey::<DefaultResolver>::from_str(xprv).unwrap();
-        let secp = Secp256k1::new();
-        let private_key = xprv.derive_priv(&secp, &derivation).unwrap().private_key;
-        // ToDo: the following is only because we use different versions of the bitcoin library. Once this is resolved, remove this conversion.
-        let private_key = PrivateKey::from_wif(&private_key.to_wif()).unwrap();
-        private_key
+    enum MultisigType {
+        Wsh,
+        ShWsh,
+        P2sh,
     }
 
-    fn get_public_key(xprv: &str, derivation: &DerivationPath) -> PublicKey {
-        let private_key = get_private_key(xprv, derivation);
-        let secp = Secp256k1::new();
-        let public_key = private_key.public_key(&secp);
-        public_key
-    }
-
-    fn construct_multisig_wallet(signer: &PrivateKey, pubkeys: &Vec<PublicKey>) -> Wallet<ElectrumBlockchain, MemoryDatabase> {
+    fn construct_multisig_wallet(
+        signer: &PrivateKey,
+        pubkeys: &Vec<PublicKey>,
+        script_type: &MultisigType,
+    ) -> Wallet<ElectrumBlockchain, MemoryDatabase> {
         let secp = Secp256k1::new();
         let pub_derived = signer.public_key(&secp);
 
-        let desc =
-            pubkeys
-            .iter()
-            .enumerate()
-            .fold("sh(wsh(multi(2,".to_string(), |acc, (i, pubkey)| {
-                let mut desc = acc;
-                if i != 0 {
-                    desc += ",";
-                }
-                if *pubkey == pub_derived {
-                    desc += &signer.to_wif();
-                } else {
-                    desc += &pubkey.to_string();
-                }
-                desc
-            })
-            + ")))";
+        let (prefix, postfix) = match script_type {
+            MultisigType::Wsh => ("wsh(", ")"),
+            MultisigType::ShWsh => ("sh(wsh(", "))"),
+            MultisigType::P2sh => ("sh(", ")"),
+        };
+        let prefix = prefix.to_string() + "multi(2,";
+        let postfix = postfix.to_string() + ")";
+        let desc = pubkeys.iter().enumerate().fold(prefix, |acc, (i, pubkey)| {
+            let mut desc = acc;
+            if i != 0 {
+                desc += ",";
+            }
+            if *pubkey == pub_derived {
+                desc += &signer.to_wif();
+            } else {
+                desc += &pubkey.to_string();
+            }
+            desc
+        }) + &postfix;
 
         let client = Client::new("ssl://electrum.blockstream.info:60002", None).unwrap();
         let wallet = Wallet::new(
@@ -311,29 +290,57 @@ mod test {
             Network::Testnet,
             MemoryDatabase::default(),
             ElectrumBlockchain::from(client),
-        ).unwrap();
+        )
+        .unwrap();
 
         wallet.sync(noop_progress(), None).unwrap();
 
         wallet
     }
 
-    #[test]
-    fn test_proof_multisig() {
-        let signer1 = "tprv8ZgxMBicQKsPdE3fMYvuvfo71bRG48RcUvSRpQ8ZTYPbRDZYGpUDzFXuhnv65yLDyTvBY47gGYQ8FjKurEWz4puybNUT3YDZKDwFW5F6Sqj";
-        let signer2 = "tprv8ZgxMBicQKsPes5uvZUX5fZKJyrSZCYW8oZmdS2mCTxWkccQv5YWA53eik4aAVEDqgqQCzgscD7RwynCmFQtFLkz22Ro9gSotJ92n36CnLY";
-        let signer3 = "tprv8ZgxMBicQKsPeV7DR58om537hMTHkj1W4X6Ewp6D8gxS1oFaNSuh72YpYqoCNyMTvRrAEn6MrUQb43wPGxpYUQ3Jo13D7jAXFz9NgHM1tUC";
-        let derivation = DerivationPath::from_str("m/0/0").unwrap();
-        let mut pubkeys = vec![get_public_key(signer1, &derivation), get_public_key(signer2, &derivation), get_public_key(signer3, &derivation)];
+    #[rstest(
+        script_type,
+        expected_address,
+        case(
+            MultisigType::Wsh,
+            "tb1qnmhmxkaqqz4lrruhew5mk6zqr0ezstn3stj6c3r2my6hgkescm0sg3qc0r"
+        ),
+        case(MultisigType::ShWsh, "2NDTiUegP4NwKMnxXm6KdCL1B1WHamhZHC1"),
+        case(MultisigType::P2sh, "2N7yrzYXgQzNQQuHNTjcP3iwpzFVsqe6non")
+    )]
+    fn test_proof_multisig(script_type: MultisigType, expected_address: &'static str) {
+        let signer1 =
+            PrivateKey::from_wif("cQCi6JdidZN5HeiHhjE7zZAJ1XJrZbj6MmpVPx8Ri3Kc8UjPgfbn").unwrap();
+        let signer2 =
+            PrivateKey::from_wif("cTTgG6x13nQjAeECaCaDrjrUdcjReZBGspcmNavsnSRyXq7zXT7r").unwrap();
+        let signer3 =
+            PrivateKey::from_wif("cUPkz3JBZinD1RRU7ngmx8cssqJ4KgBvboq1QZcGfyjqm8L6etRH").unwrap();
+        let secp = Secp256k1::new();
+        let mut pubkeys = vec![
+            signer1.public_key(&secp),
+            signer2.public_key(&secp),
+            signer3.public_key(&secp),
+        ];
         pubkeys.sort_by_key(|item| item.to_string());
-        let wallet1 = construct_multisig_wallet(&get_private_key(signer1, &derivation), &pubkeys);
-        let wallet2 = construct_multisig_wallet(&get_private_key(signer2, &derivation), &pubkeys);
-        let wallet3 = construct_multisig_wallet(&get_private_key(signer3, &derivation), &pubkeys);
-        let address = wallet1.get_new_address().unwrap();
-        assert_eq!(address.to_string(), "2NDTiUegP4NwKMnxXm6KdCL1B1WHamhZHC1");
+
+        let wallet1 = construct_multisig_wallet(&signer1, &pubkeys, &script_type);
+        let wallet2 = construct_multisig_wallet(&signer2, &pubkeys, &script_type);
+        let wallet3 = construct_multisig_wallet(&signer3, &pubkeys, &script_type);
+        assert_eq!(
+            wallet1.get_new_address().unwrap().to_string(),
+            expected_address
+        );
+        assert_eq!(
+            wallet2.get_new_address().unwrap().to_string(),
+            expected_address
+        );
+        assert_eq!(
+            wallet3.get_new_address().unwrap().to_string(),
+            expected_address
+        );
         let balance = wallet1.get_balance().unwrap();
         assert_eq!(balance, 410000);
-        
+
         let message = "All my precious coins";
         let psbt = wallet1.create_proof(message).unwrap();
 
