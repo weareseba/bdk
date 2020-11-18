@@ -14,6 +14,7 @@ serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 rand = "^0.7"
 base64 = "^0.11"
+bitcoin_ypub = { package = "bitcoin", git = "https://github.com/LNP-BP/rust-bitcoin", branch = "feat/yzpub" }
 
 # Optional dependencies
 sled = { version = "0.34", optional = true }

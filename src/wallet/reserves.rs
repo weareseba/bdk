@@ -194,8 +194,8 @@ where
 
 #[cfg(test)]
 mod test {
-    use bip39::{Mnemonic, MnemonicType, Language, Seed};
-    use bitcoin::{secp256k1::Secp256k1, Network, util::bip32::{ExtendedPubKey, ExtendedPrivKey}};
+    use bitcoin::{secp256k1::Secp256k1, Network, util::key::{PrivateKey, PublicKey}};
+    use bitcoin_ypub::util::bip32::{DefaultResolver, DerivationPath, ExtendedPrivKey};
     use rstest::rstest;
 
     use super::*;
@@ -203,6 +203,8 @@ mod test {
     use crate::database::memory::MemoryDatabase;
     use crate::electrum_client::Client;
     use crate::wallet::OfflineWallet;
+    
+    use std::str::FromStr;
 
     pub(crate) fn get_funded_wallet(
         descriptor: &str,
@@ -264,51 +266,73 @@ mod test {
         assert_eq!(spendable, balance);
     }
 
-    fn mnemonic_to_xprv(words: &str) -> ExtendedPrivKey {
-        let mnemonic = Mnemonic::from_phrase(words, Language::English).unwrap();
-        let seed = Seed::new(&mnemonic, "");
-        ExtendedPrivKey::new_master(Network::Testnet, seed.as_bytes()).unwrap()
-    }
-
-    fn mnemonic_to_xpup(words: &str) -> ExtendedPubKey {
-        let xprv = mnemonic_to_xprv(words);
+    fn get_private_key(xprv: &str, derivation: &DerivationPath) -> PrivateKey {
+        let xprv = ExtendedPrivKey::<DefaultResolver>::from_str(xprv).unwrap();
         let secp = Secp256k1::new();
-        ExtendedPubKey::from_private(&secp, &xprv) 
+        let private_key = xprv.derive_priv(&secp, &derivation).unwrap().private_key;
+        // ToDo: the following is only because we use different versions of the bitcoin library. Once this is resolved, remove this conversion.
+        let private_key = PrivateKey::from_wif(&private_key.to_wif()).unwrap();
+        private_key
     }
 
-    fn construct_multisig_wallet(signer: &ExtendedPrivKey, cosigner1: &ExtendedPubKey, cosigner2: &ExtendedPubKey) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>, Error> {
+    fn get_public_key(xprv: &str, derivation: &DerivationPath) -> PublicKey {
+        let private_key = get_private_key(xprv, derivation);
+        let secp = Secp256k1::new();
+        let public_key = private_key.public_key(&secp);
+        public_key
+    }
 
-        let desc = "wsh(multi(2, ".to_string() + 
-                    &signer.to_string()    + "/1/*, " +
-                    &cosigner1.to_string() + "/1/*, " +
-                    &cosigner2.to_string() + "/1/*" +
-                    "))";
+    fn construct_multisig_wallet(signer: &PrivateKey, pubkeys: &Vec<PublicKey>) -> Wallet<ElectrumBlockchain, MemoryDatabase> {
+        let secp = Secp256k1::new();
+        let pub_derived = signer.public_key(&secp);
 
-        let client = Client::new("ssl://electrum.blockstream.info:60002", None)?;
+        let desc =
+            pubkeys
+            .iter()
+            .enumerate()
+            .fold("sh(wsh(multi(2,".to_string(), |acc, (i, pubkey)| {
+                let mut desc = acc;
+                if i != 0 {
+                    desc += ",";
+                }
+                if *pubkey == pub_derived {
+                    desc += &signer.to_wif();
+                } else {
+                    desc += &pubkey.to_string();
+                }
+                desc
+            })
+            + ")))";
+
+        let client = Client::new("ssl://electrum.blockstream.info:60002", None).unwrap();
         let wallet = Wallet::new(
             &desc,
             None,
             Network::Testnet,
             MemoryDatabase::default(),
             ElectrumBlockchain::from(client),
-        )?;
+        ).unwrap();
 
-        wallet.sync(noop_progress(), None)?;
+        wallet.sync(noop_progress(), None).unwrap();
 
-        Ok(wallet)
+        wallet
     }
 
     #[test]
     fn test_proof_multisig() {
-        let signer1 = "lock prize genre deposit proof quarter tank clog bachelor ethics thumb impact";
-        let signer2 = "hour exchange cloud question alpha cover round brain novel luxury garment sense";
-        let signer3 = "gasp midnight road patch trigger upon stuff chase offer badge peace genuine";
-        let wallet1 = construct_multisig_wallet(&mnemonic_to_xprv(signer1), &mnemonic_to_xpup(signer2), &mnemonic_to_xpup(signer3)).unwrap();
-        let wallet2 = construct_multisig_wallet(&mnemonic_to_xprv(signer2), &mnemonic_to_xpup(signer1), &mnemonic_to_xpup(signer3)).unwrap();
-        let wallet3 = construct_multisig_wallet(&mnemonic_to_xprv(signer3), &mnemonic_to_xpup(signer1), &mnemonic_to_xpup(signer2)).unwrap();
-        let balance = wallet1.get_balance().unwrap();
+        let signer1 = "tprv8ZgxMBicQKsPdE3fMYvuvfo71bRG48RcUvSRpQ8ZTYPbRDZYGpUDzFXuhnv65yLDyTvBY47gGYQ8FjKurEWz4puybNUT3YDZKDwFW5F6Sqj";
+        let signer2 = "tprv8ZgxMBicQKsPes5uvZUX5fZKJyrSZCYW8oZmdS2mCTxWkccQv5YWA53eik4aAVEDqgqQCzgscD7RwynCmFQtFLkz22Ro9gSotJ92n36CnLY";
+        let signer3 = "tprv8ZgxMBicQKsPeV7DR58om537hMTHkj1W4X6Ewp6D8gxS1oFaNSuh72YpYqoCNyMTvRrAEn6MrUQb43wPGxpYUQ3Jo13D7jAXFz9NgHM1tUC";
+        let derivation = DerivationPath::from_str("m/0/0").unwrap();
+        let mut pubkeys = vec![get_public_key(signer1, &derivation), get_public_key(signer2, &derivation), get_public_key(signer3, &derivation)];
+        pubkeys.sort_by_key(|item| item.to_string());
+        let wallet1 = construct_multisig_wallet(&get_private_key(signer1, &derivation), &pubkeys);
+        let wallet2 = construct_multisig_wallet(&get_private_key(signer2, &derivation), &pubkeys);
+        let wallet3 = construct_multisig_wallet(&get_private_key(signer3, &derivation), &pubkeys);
         let address = wallet1.get_new_address().unwrap();
-        assert_eq!(address.to_string(), "tb1qln88nw2tnr0e36wpda8gg0wrszjk0pzpfu5lmudsml7n8km7qrtq2ypc9x");
+        assert_eq!(address.to_string(), "2NDTiUegP4NwKMnxXm6KdCL1B1WHamhZHC1");
+        let balance = wallet1.get_balance().unwrap();
+        assert_eq!(balance, 410000);
         
         let message = "All my precious coins";
         let psbt = wallet1.create_proof(message).unwrap();
