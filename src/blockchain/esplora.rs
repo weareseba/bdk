@@ -31,14 +31,14 @@
 //!
 //! ```no_run
 //! # use bdk::blockchain::esplora::EsploraBlockchain;
-//! let blockchain = EsploraBlockchain::new("https://blockstream.info/testnet/api");
+//! let blockchain = EsploraBlockchain::new("https://blockstream.info/testnet/api", None);
 //! # Ok::<(), bdk::Error>(())
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, FuturesOrdered, StreamExt, TryStreamExt};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -50,13 +50,16 @@ use reqwest::{Client, StatusCode};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::hex::ToHex;
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::{Script, Transaction, Txid};
+use bitcoin::{BlockHash, BlockHeader, Script, Transaction, TxMerkleNode, Txid};
 
-use self::utils::{ELSGetHistoryRes, ELSListUnspentRes, ElectrumLikeSync};
+use self::utils::{ELSGetHistoryRes, ElectrumLikeSync};
 use super::*;
 use crate::database::BatchDatabase;
 use crate::error::Error;
+use crate::wallet::utils::ChunksIterator;
 use crate::FeeRate;
+
+const DEFAULT_CONCURRENT_REQUESTS: u8 = 4;
 
 #[derive(Debug)]
 struct UrlClient {
@@ -64,6 +67,7 @@ struct UrlClient {
     // We use the async client instead of the blocking one because it automatically uses `fetch`
     // when the target platform is wasm32.
     client: Client,
+    concurrency: u8,
 }
 
 /// Structure that implements the logic to sync with Esplora
@@ -81,10 +85,11 @@ impl std::convert::From<UrlClient> for EsploraBlockchain {
 
 impl EsploraBlockchain {
     /// Create a new instance of the client from a base URL
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, concurrency: Option<u8>) -> Self {
         EsploraBlockchain(UrlClient {
             url: base_url.to_string(),
             client: Client::new(),
+            concurrency: concurrency.unwrap_or(DEFAULT_CONCURRENT_REQUESTS),
         })
     }
 }
@@ -159,6 +164,39 @@ impl UrlClient {
         }
 
         Ok(Some(deserialize(&resp.error_for_status()?.bytes().await?)?))
+    }
+
+    async fn _get_tx_no_opt(&self, txid: &Txid) -> Result<Transaction, EsploraError> {
+        match self._get_tx(txid).await {
+            Ok(Some(tx)) => Ok(tx),
+            Ok(None) => Err(EsploraError::TransactionNotFound(*txid)),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn _get_header(&self, block_height: u32) -> Result<BlockHeader, EsploraError> {
+        let resp = self
+            .client
+            .get(&format!("{}/block-height/{}", self.url, block_height))
+            .send()
+            .await?;
+
+        if let StatusCode::NOT_FOUND = resp.status() {
+            return Err(EsploraError::HeaderHeightNotFound(block_height));
+        }
+        let bytes = resp.bytes().await?;
+        let hash = std::str::from_utf8(&bytes)
+            .map_err(|_| EsploraError::HeaderHeightNotFound(block_height))?;
+
+        let resp = self
+            .client
+            .get(&format!("{}/block/{}", self.url, hash))
+            .send()
+            .await?;
+
+        let esplora_header = resp.json::<EsploraHeader>().await?;
+
+        Ok(esplora_header.into())
     }
 
     async fn _broadcast(&self, transaction: &Transaction) -> Result<(), EsploraError> {
@@ -249,31 +287,6 @@ impl UrlClient {
         Ok(result)
     }
 
-    async fn _script_list_unspent(
-        &self,
-        script: &Script,
-    ) -> Result<Vec<ELSListUnspentRes>, EsploraError> {
-        Ok(self
-            .client
-            .get(&format!(
-                "{}/scripthash/{}/utxo",
-                self.url,
-                Self::script_to_scripthash(script)
-            ))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Vec<EsploraListUnspent>>()
-            .await?
-            .into_iter()
-            .map(|x| ELSListUnspentRes {
-                tx_hash: x.txid,
-                height: x.status.block_height.unwrap_or(0),
-                tx_pos: x.vout,
-            })
-            .collect())
-    }
-
     async fn _get_fee_estimates(&self) -> Result<HashMap<String, f64>, EsploraError> {
         Ok(self
             .client
@@ -293,32 +306,59 @@ impl ElectrumLikeSync for UrlClient {
         scripts: I,
     ) -> Result<Vec<Vec<ELSGetHistoryRes>>, Error> {
         let future = async {
-            Ok(stream::iter(scripts)
-                .then(|script| self._script_get_history(&script))
-                .try_collect()
-                .await?)
+            let mut results = vec![];
+            for chunk in ChunksIterator::new(scripts.into_iter(), self.concurrency as usize) {
+                let mut futs = FuturesOrdered::new();
+                for script in chunk {
+                    futs.push(self._script_get_history(&script));
+                }
+                let partial_results: Vec<Vec<ELSGetHistoryRes>> = futs.try_collect().await?;
+                results.extend(partial_results);
+            }
+            Ok(stream::iter(results).collect().await)
         };
 
         await_or_block!(future)
     }
 
-    fn els_batch_script_list_unspent<'s, I: IntoIterator<Item = &'s Script>>(
+    fn els_batch_transaction_get<'s, I: IntoIterator<Item = &'s Txid>>(
         &self,
-        scripts: I,
-    ) -> Result<Vec<Vec<ELSListUnspentRes>>, Error> {
+        txids: I,
+    ) -> Result<Vec<Transaction>, Error> {
         let future = async {
-            Ok(stream::iter(scripts)
-                .then(|script| self._script_list_unspent(&script))
-                .try_collect()
-                .await?)
+            let mut results = vec![];
+            for chunk in ChunksIterator::new(txids.into_iter(), self.concurrency as usize) {
+                let mut futs = FuturesOrdered::new();
+                for txid in chunk {
+                    futs.push(self._get_tx_no_opt(&txid));
+                }
+                let partial_results: Vec<Transaction> = futs.try_collect().await?;
+                results.extend(partial_results);
+            }
+            Ok(stream::iter(results).collect().await)
         };
 
         await_or_block!(future)
     }
 
-    fn els_transaction_get(&self, txid: &Txid) -> Result<Transaction, Error> {
-        Ok(await_or_block!(self._get_tx(txid))?
-            .ok_or_else(|| EsploraError::TransactionNotFound(*txid))?)
+    fn els_batch_block_header<I: IntoIterator<Item = u32>>(
+        &self,
+        heights: I,
+    ) -> Result<Vec<BlockHeader>, Error> {
+        let future = async {
+            let mut results = vec![];
+            for chunk in ChunksIterator::new(heights.into_iter(), self.concurrency as usize) {
+                let mut futs = FuturesOrdered::new();
+                for height in chunk {
+                    futs.push(self._get_header(height));
+                }
+                let partial_results: Vec<BlockHeader> = futs.try_collect().await?;
+                results.extend(partial_results);
+            }
+            Ok(stream::iter(results).collect().await)
+        };
+
+        await_or_block!(future)
     }
 }
 
@@ -333,24 +373,50 @@ struct EsploraGetHistory {
     status: EsploraGetHistoryStatus,
 }
 
-#[derive(Deserialize)]
-struct EsploraListUnspent {
-    txid: Txid,
-    vout: usize,
-    status: EsploraGetHistoryStatus,
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+pub struct EsploraHeader {
+    pub id: String,
+    pub height: u32,
+    pub version: i32,
+    pub timestamp: u32,
+    pub tx_count: u32,
+    pub size: u32,
+    pub weight: u32,
+    pub merkle_root: TxMerkleNode,
+    pub previousblockhash: BlockHash,
+    pub nonce: u32,
+    pub bits: u32,
+    pub difficulty: u32,
+}
+
+impl Into<BlockHeader> for EsploraHeader {
+    fn into(self) -> BlockHeader {
+        BlockHeader {
+            version: self.version,
+            prev_blockhash: self.previousblockhash,
+            merkle_root: self.merkle_root,
+            time: self.timestamp,
+            bits: self.bits,
+            nonce: self.nonce,
+        }
+    }
 }
 
 /// Configuration for an [`EsploraBlockchain`]
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct EsploraBlockchainConfig {
     pub base_url: String,
+    pub concurrency: Option<u8>,
 }
 
 impl ConfigurableBlockchain for EsploraBlockchain {
     type Config = EsploraBlockchainConfig;
 
     fn from_config(config: &Self::Config) -> Result<Self, Error> {
-        Ok(EsploraBlockchain::new(config.base_url.as_str()))
+        Ok(EsploraBlockchain::new(
+            config.base_url.as_str(),
+            config.concurrency,
+        ))
     }
 }
 
@@ -366,6 +432,10 @@ pub enum EsploraError {
 
     /// Transaction not found
     TransactionNotFound(Txid),
+    /// Header height not found
+    HeaderHeightNotFound(u32),
+    /// Header hash not found
+    HeaderHashNotFound(BlockHash),
 }
 
 impl fmt::Display for EsploraError {
@@ -391,5 +461,24 @@ impl From<std::num::ParseIntError> for EsploraError {
 impl From<bitcoin::consensus::encode::Error> for EsploraError {
     fn from(other: bitcoin::consensus::encode::Error) -> Self {
         EsploraError::BitcoinEncoding(other)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::blockchain::esplora::EsploraHeader;
+    use bitcoin::hashes::hex::FromHex;
+    use bitcoin::{BlockHash, BlockHeader};
+
+    #[test]
+    fn test_esplora_header() {
+        let json_str = r#"{"id":"00000000b873e79784647a6c82962c70d228557d24a747ea4d1b8bbe878e1206","height":1,"version":1,"timestamp":1296688928,"tx_count":1,"size":190,"weight":760,"merkle_root":"f0315ffc38709d70ad5647e22048358dd3745f3ce3874223c80a7c92fab0c8ba","previousblockhash":"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943","nonce":1924588547,"bits":486604799,"difficulty":1}"#;
+        let json: EsploraHeader = serde_json::from_str(&json_str).unwrap();
+        let header: BlockHeader = json.into();
+        assert_eq!(
+            header.block_hash(),
+            BlockHash::from_hex("00000000b873e79784647a6c82962c70d228557d24a747ea4d1b8bbe878e1206")
+                .unwrap()
+        );
     }
 }

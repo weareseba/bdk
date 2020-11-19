@@ -9,7 +9,7 @@ bdk-macros = { version = "0.1.0-beta.1", path = "./macros" }
 log = "^0.4"
 bitcoin = { version = "0.25", features = ["use-serde"] }
 bitcoin_hashes = "^0.9"
-miniscript = { git = "https://github.com/MagicalBitcoin/rust-miniscript", rev = "dfc53201aa5796b6bf3b5a40581d192abaa84133" }
+miniscript = { git = "https://github.com/rust-bitcoin/rust-miniscript.git", rev = "ca60da2" }
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 rand = "^0.7"
@@ -25,6 +25,9 @@ clap = { version = "2.33", optional = true }
 #base64 = { version = "^0.11", optional = true }
 async-trait = { version = "0.1", optional = true }
 rocksdb = { version = "0.14", optional = true }
+# pin cc version to 1.0.62 because 1.0.63 break rocksdb build
+# pin cc version to 1.0.41 as used by bitcoinsensus
+cc = { version = "=1.0.41", optional = true }
 socks = { version = "0.3", optional = true }
 lazy_static = { version = "1.4", optional = true }
 tiny-bip39 = { version = "^0.7", optional = true }
@@ -44,7 +47,7 @@ compiler = ["clap", "miniscript/compiler"]
 default = ["key-value-db", "electrum"]
 electrum = ["electrum-client"]
 esplora = ["reqwest", "futures"]
-compact_filters = ["rocksdb", "socks", "lazy_static"]
+compact_filters = ["rocksdb", "socks", "lazy_static", "cc"]
 key-value-db = ["sled"]
 #cli-utils = ["clap", "base64"]
 cli-utils = ["clap"]
@@ -70,7 +73,7 @@ tiny-bip39 = "^0.7"
 
 [[example]]
 name = "repl"
-required-features = ["cli-utils"]
+required-features = ["cli-utils", "esplora"]
 [[example]]
 name = "parse_descriptor"
 [[example]]
