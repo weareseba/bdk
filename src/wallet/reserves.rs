@@ -22,16 +22,21 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use bitcoin::blockdata::{
-    opcodes,
-    script::Builder,
-    transaction::{OutPoint, Transaction, TxIn, TxOut},
+use bitcoin::{
+    blockdata::{
+        opcodes,
+        script::Builder,
+        transaction::{OutPoint, Transaction, TxIn, TxOut},
+    },
+    consensus::encode::serialize,
+    hash_types::{PubkeyHash, Txid},
+    util::{
+        address::Payload,
+        psbt::{self, Input, PartiallySignedTransaction as PSBT},
+    },
 };
-use bitcoin::hash_types::{PubkeyHash, Txid};
-use bitcoin::util::address::Payload;
-use bitcoin::util::psbt::{self, Input, PartiallySignedTransaction as PSBT};
-
 use bitcoin_hashes::{hash160, sha256d, Hash};
+use bitcoinconsensus;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -67,14 +72,7 @@ where
     D: BatchDatabase,
 {
     fn do_create_proof(&self, message: &str) -> Result<PSBT, Error> {
-        let message = "Proof-of-Reserves: ".to_string() + message;
-        let message = sha256d::Hash::hash(message.as_bytes());
-        let challenge_txin = TxIn {
-            previous_output: OutPoint::new(Txid::from_hash(message), 0),
-            sequence: 0xFFFFFFFF,
-            script_sig: Builder::new().into_script(),
-            witness: Vec::new(),
-        };
+        let challenge_txin = challenge_txin(message);
         let challenge_psbt_inp = Input {
             witness_utxo: Some(TxOut {
                 value: 0,
@@ -142,34 +140,63 @@ where
     fn do_verify_proof(&self, psbt: &PSBT, message: &str) -> Result<u64, Error> {
         let tx = psbt.clone().extract_tx();
 
+        if tx.output.len() != 1 {
+            return Err(Error::ProofOfReservesInvalid(format!(
+                "Wrong number of outputs: {}",
+                tx.output.len()
+            )));
+        }
+        if tx.input.len() <= 1 {
+            return Err(Error::ProofOfReservesInvalid(format!(
+                "Wrong number of inputs: {}",
+                tx.input.len()
+            )));
+        }
+
         // verify the challenge txin
-        let message = "Proof-of-Reserves: ".to_string() + message;
-        let message = sha256d::Hash::hash(message.as_bytes());
-        let fake_txid = Txid::from_hash(message);
-        let first_txid = tx.input[0].previous_output.txid;
-        if first_txid != fake_txid {
-            return Err(Error::ProofOfReservesInvalid);
+        let challenge_txin = challenge_txin(message);
+        if tx.input[0].previous_output != challenge_txin.previous_output {
+            return Err(Error::ProofOfReservesInvalid(
+                "Challenge txin mismatch".to_string(),
+            ));
         }
 
-        // verify the proof UTXOs
-        let _utxos = self.list_unspent()?;
-/*
-        let _client = match self.client() {
-            Some(cli) => cli,
-            None => return Err(Error::CannotVerifyProof),
-        };
-*/
-        let mut sum = 0;
-        for inp in psbt.inputs.iter().skip(1) {
-            sum += self.get_spendable_value_from_input(inp)?;
-        }
-
+        // verify the proof UTXOs are still spendable
         // ToDo: verify that the proof inputs were spendable at the block height of the proof
+        let utxos = self.list_unspent()?;
+        if let Some(inp) = tx
+            .input
+            .iter()
+            .skip(1)
+            .find(|i| utxos.iter().find(|u| u.outpoint == i.previous_output) == None)
+        {
+            return Err(Error::ProofOfReservesInvalid(format!(
+                "Found an input that is not spendable: {:?}",
+                inp
+            )));
+        }
 
-        // ToDo: verify the signatures
+        // Verify other inputs against prevouts and calculate the amount.
+        // ToDo: make sure this is enough to verify the signatures
+        let serialized_tx = serialize(&tx);
+        for (idx, utxo) in utxos.into_iter().enumerate() {
+            // Verify the script execution of the input.
+            if let Err(err) = bitcoinconsensus::verify(
+                utxo.txout.script_pubkey.to_bytes().as_slice(),
+                utxo.txout.value,
+                &serialized_tx,
+                idx + 1, // skipped the challenge input
+            ) {
+                return Err(Error::ProofOfReservesInvalid(format!("{:?}", err)));
+            }
+        }
+
+        // calculate the spendable amount of the proof
+        let sum = psbt.inputs.iter().fold(0, |acc, inp| {
+            acc + self.get_spendable_value_from_input(inp).unwrap_or(0)
+        });
 
         // verify the unspendable output
-        assert_eq!(tx.output.len(), 1);
         let pkh = PubkeyHash::from_hash(hash160::Hash::hash(&[0]));
         let out_script_unspendable = bitcoin::Address {
             payload: Payload::PubkeyHash(pkh),
@@ -177,7 +204,7 @@ where
         }
         .script_pubkey();
         if tx.output[0].script_pubkey != out_script_unspendable {
-            return Err(Error::ProofOfReservesInvalid);
+            return Err(Error::ProofOfReservesInvalid("Invalid output".to_string()));
         }
 
         Ok(sum)
@@ -186,20 +213,39 @@ where
     /// Calculate the spendable value from an input
     fn get_spendable_value_from_input(&self, pinp: &psbt::Input) -> Result<u64, Error> {
         if pinp.witness_utxo.is_none() {
-            return Err(Error::ProofOfReservesInvalid);
+            return Err(Error::ProofOfReservesInvalid(
+                "Failed to deterrmine the amount of an input".to_string(),
+            ));
         };
         Ok(pinp.witness_utxo.as_ref().unwrap().value)
+    }
+}
+
+/// Construct a challenge input with the message
+fn challenge_txin(message: &str) -> TxIn {
+    let message = "Proof-of-Reserves: ".to_string() + message;
+    let message = sha256d::Hash::hash(message.as_bytes());
+    TxIn {
+        previous_output: OutPoint::new(Txid::from_hash(message), 0),
+        sequence: 0xFFFFFFFF,
+        script_sig: Builder::new().into_script(),
+        witness: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod test {
     use bitcoin::{
+        consensus::Encodable,
         secp256k1::Secp256k1,
         util::key::{PrivateKey, PublicKey},
         Network,
     };
     use rstest::rstest;
+    use std::{
+        fs::{self, File},
+        io::Write,
+    };
 
     use super::*;
     use crate::blockchain::{noop_progress, ElectrumBlockchain};
@@ -236,17 +282,19 @@ mod test {
         case("wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),older(6)))"),     // and(pk(Alice),older(6))
         case("wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))") // and(pk(Alice),after(100000))
     )]
-    fn test_proof(descriptor: &'static str) {
+    fn test_proof(descriptor: &'static str) -> Result<(), Error> {
         let (wallet, _, _) = get_funded_wallet(descriptor, Network::Bitcoin);
-        let balance = wallet.get_balance().unwrap();
+        let balance = wallet.get_balance()?;
 
         let message = "This belongs to me.";
-        let psbt = wallet.create_proof(&message).unwrap();
+        let psbt = wallet.create_proof(&message)?;
 
-        let (signed_psbt, _finalized) = wallet.sign(psbt, None).unwrap();
+        let (signed_psbt, _finalized) = wallet.sign(psbt, None)?;
 
-        let spendable = wallet.verify_proof(&signed_psbt, &message).unwrap();
+        let spendable = wallet.verify_proof(&signed_psbt, &message)?;
         assert_eq!(spendable, balance);
+
+        Ok(())
     }
 
     enum MultisigType {
@@ -259,7 +307,7 @@ mod test {
         signer: &PrivateKey,
         pubkeys: &Vec<PublicKey>,
         script_type: &MultisigType,
-    ) -> Wallet<ElectrumBlockchain, MemoryDatabase> {
+    ) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>, Error> {
         let secp = Secp256k1::new();
         let pub_derived = signer.public_key(&secp);
 
@@ -283,19 +331,18 @@ mod test {
             desc
         }) + &postfix;
 
-        let client = Client::new("ssl://electrum.blockstream.info:60002", None).unwrap();
+        let client = Client::new("ssl://electrum.blockstream.info:60002", None)?;
         let wallet = Wallet::new(
             &desc,
             None,
             Network::Testnet,
             MemoryDatabase::default(),
             ElectrumBlockchain::from(client),
-        )
-        .unwrap();
+        )?;
 
-        wallet.sync(noop_progress(), None).unwrap();
+        wallet.sync(noop_progress(), None)?;
 
-        wallet
+        Ok(wallet)
     }
 
     #[rstest(
@@ -308,7 +355,10 @@ mod test {
         case(MultisigType::ShWsh, "2NDTiUegP4NwKMnxXm6KdCL1B1WHamhZHC1"),
         case(MultisigType::P2sh, "2N7yrzYXgQzNQQuHNTjcP3iwpzFVsqe6non")
     )]
-    fn test_proof_multisig(script_type: MultisigType, expected_address: &'static str) {
+    fn test_proof_multisig(
+        script_type: MultisigType,
+        expected_address: &'static str,
+    ) -> Result<(), Error> {
         let signer1 =
             PrivateKey::from_wif("cQCi6JdidZN5HeiHhjE7zZAJ1XJrZbj6MmpVPx8Ri3Kc8UjPgfbn").unwrap();
         let signer2 =
@@ -323,32 +373,49 @@ mod test {
         ];
         pubkeys.sort_by_key(|item| item.to_string());
 
-        let wallet1 = construct_multisig_wallet(&signer1, &pubkeys, &script_type);
-        let wallet2 = construct_multisig_wallet(&signer2, &pubkeys, &script_type);
-        let wallet3 = construct_multisig_wallet(&signer3, &pubkeys, &script_type);
-        assert_eq!(
-            wallet1.get_new_address().unwrap().to_string(),
-            expected_address
-        );
-        assert_eq!(
-            wallet2.get_new_address().unwrap().to_string(),
-            expected_address
-        );
-        assert_eq!(
-            wallet3.get_new_address().unwrap().to_string(),
-            expected_address
-        );
-        let balance = wallet1.get_balance().unwrap();
+        let wallet1 = construct_multisig_wallet(&signer1, &pubkeys, &script_type)?;
+        let wallet2 = construct_multisig_wallet(&signer2, &pubkeys, &script_type)?;
+        let wallet3 = construct_multisig_wallet(&signer3, &pubkeys, &script_type)?;
+        assert_eq!(wallet1.get_new_address()?.to_string(), expected_address);
+        assert_eq!(wallet2.get_new_address()?.to_string(), expected_address);
+        assert_eq!(wallet3.get_new_address()?.to_string(), expected_address);
+        let balance = wallet1.get_balance()?;
         assert_eq!(balance, 410000);
 
         let message = "All my precious coins";
-        let psbt = wallet1.create_proof(message).unwrap();
+        let psbt = wallet1.create_proof(message)?;
 
-        let (psbt, _finalized) = wallet1.sign(psbt, None).unwrap();
-        let (psbt, _finalized) = wallet2.sign(psbt, None).unwrap();
-        let (psbt, _finalized) = wallet3.sign(psbt, None).unwrap();
+        let (psbt, _finalized) = wallet1.sign(psbt, None)?;
+        let (psbt, _finalized) = wallet2.sign(psbt, None)?;
+        let (psbt, _finalized) = wallet3.sign(psbt, None)?;
 
-        let spendable = wallet1.verify_proof(&psbt, &message).unwrap();
+        let (psbt, finalized) = wallet1.finalize_psbt(psbt, None)?;
+        if !finalized {
+            write_to_temp_file(&psbt);
+        }
+
+        let spendable = wallet1.verify_proof(&psbt, &message)?;
         assert_eq!(spendable, balance);
+
+        Ok(())
+    }
+
+    fn write_to_temp_file(psbt: &PSBT) {
+        let data = encode_tx(psbt).unwrap();
+        let filename = "/tmp/psbt";
+        fs::remove_file(filename);
+        let mut file = File::create(&filename).unwrap();
+        file.write_all(&data);
+        file.sync_all();
+    }
+
+    fn encode_tx(psbt: &PSBT) -> Result<Vec<u8>, Error> {
+        let mut encoded = Vec::<u8>::new();
+        if psbt.consensus_encode(&mut encoded).is_err() {
+            return Err(Error::CannotVerifyProof);
+        }
+        let tx = base64::encode(&encoded);
+
+        Ok(tx.as_bytes().to_vec())
     }
 }

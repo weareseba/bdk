@@ -54,7 +54,7 @@ pub enum Error {
     FeeTooLow {
         required: u64,
     },
-    ProofOfReservesInvalid,
+    ProofOfReservesInvalid(String),
     CannotVerifyProof,
 
     Key(crate::keys::KeyError),
