@@ -176,6 +176,19 @@ where
             )));
         }
 
+        // verify that the inputs are signed, except the challenge
+        if let Some(inp) = tx
+            .input
+            .iter()
+            .skip(1)
+            .find(|i| i.script_sig == Builder::new().into_script())
+        {
+            return Err(Error::ProofOfReservesInvalid(format!(
+                "Found an input that is not signed: {:?}",
+                inp
+            )));
+        }
+
         // Verify other inputs against prevouts and calculate the amount.
         // ToDo: make sure this is enough to verify the signatures
         let serialized_tx = serialize(&tx);
