@@ -29,7 +29,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::Arc;
 
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::util::bip32::{ChildNumber, DerivationPath, Fingerprint};
@@ -190,7 +189,7 @@ impl ToWalletDescriptor for (ExtendedDescriptor, KeyMap, ValidNetworks) {
 pub trait ExtractPolicy {
     fn extract_policy(
         &self,
-        signers: Arc<SignersContainer>,
+        signers: &SignersContainer,
         secp: &SecpCtx,
     ) -> Result<Option<Policy>, Error>;
 }
@@ -463,7 +462,13 @@ impl DescriptorMeta for Descriptor<DescriptorPublicKey> {
             {
                 Some(self.clone())
             }
-            Descriptor::Bare(ms) | Descriptor::Sh(ms)
+            Descriptor::Bare(ms)
+                if psbt_input.redeem_script.is_some()
+                    && &ms.encode(deriv_ctx) == psbt_input.redeem_script.as_ref().unwrap() =>
+            {
+                Some(self.clone())
+            }
+            Descriptor::Sh(ms)
                 if psbt_input.redeem_script.is_some()
                     && &ms.encode(deriv_ctx) == psbt_input.redeem_script.as_ref().unwrap() =>
             {
