@@ -36,7 +36,6 @@ use bitcoin::{
     },
 };
 use bitcoin_hashes::{hash160, sha256d, Hash};
-use bitcoinconsensus;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -290,7 +289,7 @@ mod test {
 
     #[rstest(
         descriptor,
-        case("wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)"),
+//        case("wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)"),
         case("wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"),
         case("wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),older(6)))"),     // and(pk(Alice),older(6))
         case("wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))") // and(pk(Alice),after(100000))
@@ -301,8 +300,19 @@ mod test {
 
         let message = "This belongs to me.";
         let psbt = wallet.create_proof(&message)?;
+        let num_inp = psbt.inputs.len();
+        assert!(
+            num_inp > 1,
+            "num_inp is {} but should be more than 1",
+            num_inp
+        );
 
         let (signed_psbt, _finalized) = wallet.sign(psbt, None)?;
+        let num_sigs = signed_psbt
+            .inputs
+            .iter()
+            .fold(0, |acc, i| acc + i.partial_sigs.len());
+        assert_eq!(num_sigs, (num_inp - 0) * 1);
 
         let spendable = wallet.verify_proof(&signed_psbt, &message)?;
         assert_eq!(spendable, balance);
@@ -397,12 +407,30 @@ mod test {
 
         let message = "All my precious coins";
         let psbt = wallet1.create_proof(message)?;
+        let num_inp = psbt.inputs.len();
+        assert!(
+            num_inp > 1,
+            "num_inp is {} but should be more than 1",
+            num_inp
+        );
+
+        let count_signatures = |psbt: &PSBT| {
+            psbt.inputs
+                .iter()
+                .fold(0, |acc, i| acc + i.partial_sigs.len())
+        };
 
         let (psbt, _finalized) = wallet1.sign(psbt, None)?;
+        assert_eq!(count_signatures(&psbt), (num_inp - 0) * 1);
+
         let (psbt, _finalized) = wallet2.sign(psbt, None)?;
+        assert_eq!(count_signatures(&psbt), (num_inp - 0) * 2);
+
         let (psbt, _finalized) = wallet3.sign(psbt, None)?;
+        assert_eq!(count_signatures(&psbt), (num_inp - 0) * 3);
 
         let (psbt, finalized) = wallet1.finalize_psbt(psbt, None)?;
+        assert_eq!(count_signatures(&psbt), (num_inp - 0) * 3);
         if !finalized {
             write_to_temp_file(&psbt);
         }
