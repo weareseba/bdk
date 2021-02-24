@@ -29,31 +29,30 @@ use bitcoin::hash_types::Txid;
 
 use serde::{Deserialize, Serialize};
 
-/// Types of script
+/// Types of keychains
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ScriptType {
+pub enum KeychainKind {
+    /// External
     External = 0,
+    /// Internal, usually used for change outputs
     Internal = 1,
 }
 
-impl ScriptType {
+impl KeychainKind {
+    /// Return [`KeychainKind`] as a byte
     pub fn as_byte(&self) -> u8 {
         match self {
-            ScriptType::External => b'e',
-            ScriptType::Internal => b'i',
+            KeychainKind::External => b'e',
+            KeychainKind::Internal => b'i',
         }
-    }
-
-    pub fn is_internal(&self) -> bool {
-        self == &ScriptType::Internal
     }
 }
 
-impl AsRef<[u8]> for ScriptType {
+impl AsRef<[u8]> for KeychainKind {
     fn as_ref(&self) -> &[u8] {
         match self {
-            ScriptType::External => b"e",
-            ScriptType::Internal => b"i",
+            KeychainKind::External => b"e",
+            KeychainKind::Internal => b"i",
         }
     }
 }
@@ -94,19 +93,29 @@ impl std::default::Default for FeeRate {
 /// A wallet unspent output
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct UTXO {
+    /// Reference to a transaction output
     pub outpoint: OutPoint,
+    /// Transaction output
     pub txout: TxOut,
-    pub is_internal: bool,
+    /// Type of keychain
+    pub keychain: KeychainKind,
 }
 
 /// A wallet transaction
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct TransactionDetails {
+    /// Optional transaction
     pub transaction: Option<Transaction>,
+    /// Transaction id
     pub txid: Txid,
+    /// Timestamp
     pub timestamp: u64,
+    /// Received value (sats)
     pub received: u64,
+    /// Sent value (sats)
     pub sent: u64,
+    /// Fee value (sats)
     pub fees: u64,
+    /// Confirmed in block height, `None` means unconfirmed
     pub height: Option<u32>,
 }

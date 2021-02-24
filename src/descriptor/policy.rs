@@ -27,6 +27,8 @@
 //! This module implements the logic to extract and represent the spending policies of a descriptor
 //! in a more human-readable format.
 //!
+//! This is an **EXPERIMENTAL** feature, API and other major changes are expected.
+//!
 //! ## Example
 //!
 //! ```
@@ -36,7 +38,7 @@
 //! let secp = Secp256k1::new();
 //! let desc = "wsh(and_v(v:pk(cV3oCth6zxZ1UVsHLnGothsWNsaoxRhC6aeNi5VbSdFpwUkgkEci),or_d(pk(cVMTy7uebJgvFaSBwcgvwk8qn8xSLc97dKow4MBetjrrahZoimm2),older(12960))))";
 //!
-//! let (extended_desc, key_map) = ExtendedDescriptor::parse_descriptor(desc)?;
+//! let (extended_desc, key_map) = ExtendedDescriptor::parse_descriptor(&secp, desc)?;
 //! println!("{:?}", extended_desc);
 //!
 //! let signers = Arc::new(key_map.into());
@@ -45,7 +47,7 @@
 //! # Ok::<(), bdk::Error>(())
 //! ```
 
-use std::cmp::{max, Ordering};
+use std::cmp::max;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 
@@ -56,15 +58,15 @@ use bitcoin::hashes::*;
 use bitcoin::util::bip32::Fingerprint;
 use bitcoin::PublicKey;
 
-use miniscript::descriptor::{DescriptorPublicKey, SortedMultiVec};
+use miniscript::descriptor::{DescriptorPublicKey, ShInner, SortedMultiVec, WshInner};
 use miniscript::{Descriptor, Miniscript, MiniscriptKey, ScriptContext, Terminal, ToPublicKey};
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
 
-use crate::descriptor::ExtractPolicy;
+use crate::descriptor::{DerivedDescriptorKey, ExtractPolicy};
 use crate::wallet::signer::{SignerId, SignersContainer};
-use crate::wallet::utils::{descriptor_to_pk_ctx, SecpCtx};
+use crate::wallet::utils::{self, SecpCtx};
 
 use super::checksum::get_checksum;
 use super::error::Error;
@@ -103,52 +105,76 @@ impl PKOrF {
     }
 }
 
-/// An item that need to be satisfied
+/// An item that needs to be satisfied
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "UPPERCASE")]
 pub enum SatisfiableItem {
     // Leaves
+    /// Signature for a raw public key
     Signature(PKOrF),
+    /// Signature for an extended key fingerprint
     SignatureKey(PKOrF),
+    /// SHA256 preimage hash
     SHA256Preimage {
+        /// The digest value
         hash: sha256::Hash,
     },
+    /// Double SHA256 preimage hash
     HASH256Preimage {
+        /// The digest value
         hash: sha256d::Hash,
     },
+    /// RIPEMD160 preimage hash
     RIPEMD160Preimage {
+        /// The digest value
         hash: ripemd160::Hash,
     },
+    /// SHA256 then RIPEMD160 preimage hash
     HASH160Preimage {
+        /// The digest value
         hash: hash160::Hash,
     },
+    /// Absolute timeclock timestamp
     AbsoluteTimelock {
+        /// The timestamp value
         value: u32,
     },
+    /// Relative timelock locktime
     RelativeTimelock {
+        /// The locktime value
         value: u32,
+    },
+    /// Multi-signature public keys with threshold count
+    Multisig {
+        /// The raw public key or extended key fingerprint
+        keys: Vec<PKOrF>,
+        /// The required threshold count
+        threshold: usize,
     },
 
     // Complex item
+    /// Threshold items with threshold count
     Thresh {
+        /// The policy items
         items: Vec<Policy>,
-        threshold: usize,
-    },
-    Multisig {
-        keys: Vec<PKOrF>,
+        /// The required threshold count
         threshold: usize,
     },
 }
 
 impl SatisfiableItem {
+    /// Returns whether the [`SatisfiableItem`] is a leaf item
     pub fn is_leaf(&self) -> bool {
-        !matches!(self,
-        SatisfiableItem::Thresh {
-            items: _,
-            threshold: _,
-        })
+        !matches!(
+            self,
+            SatisfiableItem::Thresh {
+                items: _,
+                threshold: _,
+            }
+        )
     }
 
+    /// Returns a unique id for the [`SatisfiableItem`]
     pub fn id(&self) -> String {
         get_checksum(&serde_json::to_string(self).expect("Failed to serialize a SatisfiableItem"))
             .expect("Failed to compute a SatisfiableItem id")
@@ -213,7 +239,9 @@ fn mix<T: Clone>(vec: Vec<Vec<T>>) -> Vec<Vec<T>> {
     answer
 }
 
+/// Type for a map of sets of [`Condition`] items keyed by each set's index
 pub type ConditionMap = BTreeMap<usize, HashSet<Condition>>;
+/// Type for a map of folded sets of [`Condition`] items keyed by a vector of the combined set's indexes
 pub type FoldedConditionMap = BTreeMap<Vec<usize>, HashSet<Condition>>;
 
 fn serialize_folded_cond_map<S>(
@@ -279,6 +307,7 @@ pub enum Satisfaction {
 }
 
 impl Satisfaction {
+    /// Returns whether the [`Satisfaction`] is a leaf item
     pub fn is_leaf(&self) -> bool {
         match self {
             Satisfaction::None | Satisfaction::Complete { .. } => true,
@@ -325,7 +354,7 @@ impl Satisfaction {
         }
     }
 
-    fn finalize(&mut self) -> Result<(), PolicyError> {
+    fn finalize(&mut self) {
         // if partial try to bump it to a partialcomplete
         if let Satisfaction::Partial {
             n,
@@ -363,7 +392,7 @@ impl Satisfaction {
                     // since the previous step can turn one item of the iterator into multiple ones, we call flatten to expand them out
                     .flatten()
                     // .inspect(|x| println!("flat {:?}", x))
-                    // try to fold all the conditions for this specific combination of indexes/options. if they are not compatibile, try_fold will be Err
+                    // try to fold all the conditions for this specific combination of indexes/options. if they are not compatible, try_fold will be Err
                     .map(|(key, val)| {
                         (
                             key,
@@ -391,8 +420,6 @@ impl Satisfaction {
                 };
             }
         }
-
-        Ok(())
     }
 }
 
@@ -426,17 +453,30 @@ pub struct Policy {
 /// An extra condition that must be satisfied but that is out of control of the user
 #[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
 pub struct Condition {
+    /// Optional CheckSequenceVerify condition
     #[serde(skip_serializing_if = "Option::is_none")]
     pub csv: Option<u32>,
+    /// Optional timelock condition
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timelock: Option<u32>,
 }
 
 impl Condition {
-    fn merge_timelock(a: u32, b: u32) -> Result<u32, PolicyError> {
-        const BLOCKS_TIMELOCK_THRESHOLD: u32 = 500000000;
+    fn merge_nlocktime(a: u32, b: u32) -> Result<u32, PolicyError> {
+        if (a < utils::BLOCKS_TIMELOCK_THRESHOLD) != (b < utils::BLOCKS_TIMELOCK_THRESHOLD) {
+            Err(PolicyError::MixedTimelockUnits)
+        } else {
+            Ok(max(a, b))
+        }
+    }
 
-        if (a < BLOCKS_TIMELOCK_THRESHOLD) != (b < BLOCKS_TIMELOCK_THRESHOLD) {
+    fn merge_nsequence(a: u32, b: u32) -> Result<u32, PolicyError> {
+        let mask = utils::SEQUENCE_LOCKTIME_TYPE_FLAG | utils::SEQUENCE_LOCKTIME_MASK;
+
+        let a = a & mask;
+        let b = b & mask;
+
+        if (a < utils::SEQUENCE_LOCKTIME_TYPE_FLAG) != (b < utils::SEQUENCE_LOCKTIME_TYPE_FLAG) {
             Err(PolicyError::MixedTimelockUnits)
         } else {
             Ok(max(a, b))
@@ -445,13 +485,13 @@ impl Condition {
 
     pub(crate) fn merge(mut self, other: &Condition) -> Result<Self, PolicyError> {
         match (self.csv, other.csv) {
-            (Some(a), Some(b)) => self.csv = Some(Self::merge_timelock(a, b)?),
+            (Some(a), Some(b)) => self.csv = Some(Self::merge_nsequence(a, b)?),
             (None, any) => self.csv = any,
             _ => {}
         }
 
         match (self.timelock, other.timelock) {
-            (Some(a), Some(b)) => self.timelock = Some(Self::merge_timelock(a, b)?),
+            (Some(a), Some(b)) => self.timelock = Some(Self::merge_nlocktime(a, b)?),
             (None, any) => self.timelock = any,
             _ => {}
         }
@@ -459,20 +499,26 @@ impl Condition {
         Ok(self)
     }
 
+    /// Returns `true` if there are no extra conditions to verify
     pub fn is_null(&self) -> bool {
         self.csv.is_none() && self.timelock.is_none()
     }
 }
 
 /// Errors that can happen while extracting and manipulating policies
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum PolicyError {
+    /// Not enough items are selected to satisfy a [`SatisfiableItem::Thresh`] or a [`SatisfiableItem::Multisig`]
     NotEnoughItemsSelected(String),
-    TooManyItemsSelected(String),
+    /// Index out of range for an item to satisfy a [`SatisfiableItem::Thresh`] or a [`SatisfiableItem::Multisig`]
     IndexOutOfRange(usize),
+    /// Can not add to an item that is [`Satisfaction::None`] or [`Satisfaction::Complete`]
     AddOnLeaf,
+    /// Can not add to an item that is [`Satisfaction::PartialComplete`]
     AddOnPartialComplete,
+    /// Can not merge CSV or timelock values unless both are less than or both are equal or greater than 500_000_000
     MixedTimelockUnits,
+    /// Incompatible conditions (not currently used)
     IncompatibleConditions,
 }
 
@@ -525,7 +571,7 @@ impl Policy {
         for (index, item) in items.iter().enumerate() {
             contribution.add(&item.contribution, index)?;
         }
-        contribution.finalize()?;
+        contribution.finalize();
 
         let mut policy: Policy = SatisfiableItem::Thresh { items, threshold }.into();
         policy.contribution = contribution;
@@ -563,7 +609,7 @@ impl Policy {
                 )?;
             }
         }
-        contribution.finalize()?;
+        contribution.finalize();
 
         let mut policy: Policy = SatisfiableItem::Multisig {
             keys: parsed_keys,
@@ -596,10 +642,10 @@ impl Policy {
             SatisfiableItem::Thresh { items, threshold } if items.len() == *threshold => {
                 (0..*threshold).collect()
             }
+            SatisfiableItem::Multisig { keys, .. } => (0..keys.len()).collect(),
             _ => vec![],
         };
         let selected = match path.get(&self.id) {
-            _ if !default.is_empty() => &default,
             Some(arr) => arr,
             _ => &default,
         };
@@ -620,14 +666,8 @@ impl Policy {
                 // if we have something, make sure we have enough items. note that the user can set
                 // an empty value for this step in case of n-of-n, because `selected` is set to all
                 // the elements above
-                match selected.len().cmp(threshold) {
-                    Ordering::Less => {
-                        return Err(PolicyError::NotEnoughItemsSelected(self.id.clone()))
-                    }
-                    Ordering::Greater => {
-                        return Err(PolicyError::TooManyItemsSelected(self.id.clone()))
-                    }
-                    Ordering::Equal => (),
+                if selected.len() < *threshold {
+                    return Err(PolicyError::NotEnoughItemsSelected(self.id.clone()));
                 }
 
                 // check the selected items, see if there are conflicting requirements
@@ -642,7 +682,16 @@ impl Policy {
 
                 Ok(requirements)
             }
-            _ if !selected.is_empty() => Err(PolicyError::TooManyItemsSelected(self.id.clone())),
+            SatisfiableItem::Multisig { keys, threshold } => {
+                if selected.len() < *threshold {
+                    return Err(PolicyError::NotEnoughItemsSelected(self.id.clone()));
+                }
+                if let Some(item) = selected.iter().find(|i| **i >= keys.len()) {
+                    return Err(PolicyError::IndexOutOfRange(*item));
+                }
+
+                Ok(Condition::default())
+            }
             SatisfiableItem::AbsoluteTimelock { value } => Ok(Condition {
                 csv: None,
                 timelock: Some(*value),
@@ -688,8 +737,9 @@ fn signature_key(
     signers: &SignersContainer,
     secp: &SecpCtx,
 ) -> Policy {
-    let deriv_ctx = descriptor_to_pk_ctx(secp);
-    let key_hash = key.to_public_key(deriv_ctx).to_pubkeyhash();
+    let key_hash = DerivedDescriptorKey::new(key.clone(), secp)
+        .to_public_key()
+        .to_pubkeyhash();
     let mut policy: Policy = SatisfiableItem::Signature(PKOrF::from_key_hash(key_hash)).into();
 
     if signers.find(SignerId::PkHash(key_hash)).is_some() {
@@ -816,38 +866,37 @@ impl ExtractPolicy for Descriptor<DescriptorPublicKey> {
         }
 
         match self {
-            Descriptor::Pk(pubkey)
-            | Descriptor::Pkh(pubkey)
-            | Descriptor::Wpkh(pubkey)
-            | Descriptor::ShWpkh(pubkey) => Ok(Some(signature(pubkey, signers, secp))),
-            Descriptor::Bare(inner) => Ok(inner.extract_policy(signers, secp)?),
-            Descriptor::Sh(inner) => Ok(inner.extract_policy(signers, secp)?),
-            Descriptor::Wsh(inner) | Descriptor::ShWsh(inner) => {
-                Ok(inner.extract_policy(signers, secp)?)
-            }
-
-            // `sortedmulti()` is handled separately
-            Descriptor::ShSortedMulti(keys) => make_sortedmulti(&keys, signers, secp),
-            Descriptor::ShWshSortedMulti(keys) | Descriptor::WshSortedMulti(keys) => {
-                make_sortedmulti(&keys, signers, secp)
-            }
+            Descriptor::Pkh(pk) => Ok(Some(signature(pk.as_inner(), signers, secp))),
+            Descriptor::Wpkh(pk) => Ok(Some(signature(pk.as_inner(), signers, secp))),
+            Descriptor::Sh(sh) => match sh.as_inner() {
+                ShInner::Wpkh(pk) => Ok(Some(signature(pk.as_inner(), signers, secp))),
+                ShInner::Ms(ms) => Ok(ms.extract_policy(signers, secp)?),
+                ShInner::SortedMulti(ref keys) => make_sortedmulti(keys, signers, secp),
+                ShInner::Wsh(wsh) => match wsh.as_inner() {
+                    WshInner::Ms(ms) => Ok(ms.extract_policy(signers, secp)?),
+                    WshInner::SortedMulti(ref keys) => make_sortedmulti(keys, signers, secp),
+                },
+            },
+            Descriptor::Wsh(wsh) => match wsh.as_inner() {
+                WshInner::Ms(ms) => Ok(ms.extract_policy(signers, secp)?),
+                WshInner::SortedMulti(ref keys) => make_sortedmulti(keys, signers, secp),
+            },
+            Descriptor::Bare(ms) => Ok(ms.as_inner().extract_policy(signers, secp)?),
         }
     }
 }
 
 #[cfg(test)]
 mod test {
-
     use crate::descriptor;
-    use crate::descriptor::{ExtractPolicy, ToWalletDescriptor};
+    use crate::descriptor::{ExtractPolicy, IntoWalletDescriptor};
 
     use super::*;
     use crate::descriptor::policy::SatisfiableItem::{Multisig, Signature, Thresh};
-    use crate::keys::{DescriptorKey, ToDescriptorKey};
+    use crate::keys::{DescriptorKey, IntoDescriptorKey};
     use crate::wallet::signer::SignersContainer;
     use bitcoin::secp256k1::{All, Secp256k1};
     use bitcoin::util::bip32;
-    use bitcoin::util::bip32::ChildNumber;
     use bitcoin::Network;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -865,8 +914,8 @@ mod test {
         let tprv = bip32::ExtendedPrivKey::from_str(tprv).unwrap();
         let tpub = bip32::ExtendedPubKey::from_private(&secp, &tprv);
         let fingerprint = tprv.fingerprint(&secp);
-        let prvkey = (tprv, path.clone()).to_descriptor_key().unwrap();
-        let pubkey = (tpub, path).to_descriptor_key().unwrap();
+        let prvkey = (tprv, path.clone()).into_descriptor_key().unwrap();
+        let pubkey = (tpub, path).into_descriptor_key().unwrap();
 
         (prvkey, pubkey, fingerprint)
     }
@@ -875,9 +924,13 @@ mod test {
 
     #[test]
     fn test_extract_policy_for_wpkh() {
+        let secp = Secp256k1::new();
+
         let (prvkey, pubkey, fingerprint) = setup_keys(TPRV0_STR);
         let desc = descriptor!(wpkh(pubkey)).unwrap();
-        let (wallet_desc, keymap) = desc.to_wallet_descriptor(Network::Testnet).unwrap();
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
         let signers_container = Arc::new(SignersContainer::from(keymap));
         let policy = wallet_desc
             .extract_policy(&signers_container, &Secp256k1::new())
@@ -890,7 +943,9 @@ mod test {
         assert!(matches!(&policy.contribution, Satisfaction::None));
 
         let desc = descriptor!(wpkh(prvkey)).unwrap();
-        let (wallet_desc, keymap) = desc.to_wallet_descriptor(Network::Testnet).unwrap();
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
         let signers_container = Arc::new(SignersContainer::from(keymap));
         let policy = wallet_desc
             .extract_policy(&signers_container, &Secp256k1::new())
@@ -966,11 +1021,16 @@ mod test {
 
     // 1 prv and 1 pub key descriptor, required 1 prv keys
     #[test]
+    #[ignore] // see https://github.com/bitcoindevkit/bdk/issues/225
     fn test_extract_policy_for_sh_multi_complete_1of2() {
+        let secp = Secp256k1::new();
+
         let (_prvkey0, pubkey0, fingerprint0) = setup_keys(TPRV0_STR);
         let (prvkey1, _pubkey1, fingerprint1) = setup_keys(TPRV1_STR);
-        let desc = descriptor!(sh(multi 1, pubkey0, prvkey1)).unwrap();
-        let (wallet_desc, keymap) = desc.to_wallet_descriptor(Network::Testnet).unwrap();
+        let desc = descriptor!(sh(multi(1, pubkey0, prvkey1))).unwrap();
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
         let signers_container = Arc::new(SignersContainer::from(keymap));
         let policy = wallet_desc
             .extract_policy(&signers_container, &Secp256k1::new())
@@ -995,10 +1055,14 @@ mod test {
     // 2 prv keys descriptor, required 2 prv keys
     #[test]
     fn test_extract_policy_for_sh_multi_complete_2of2() {
+        let secp = Secp256k1::new();
+
         let (prvkey0, _pubkey0, fingerprint0) = setup_keys(TPRV0_STR);
         let (prvkey1, _pubkey1, fingerprint1) = setup_keys(TPRV1_STR);
-        let desc = descriptor!(sh(multi 2, prvkey0, prvkey1)).unwrap();
-        let (wallet_desc, keymap) = desc.to_wallet_descriptor(Network::Testnet).unwrap();
+        let desc = descriptor!(sh(multi(2, prvkey0, prvkey1))).unwrap();
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
         let signers_container = Arc::new(SignersContainer::from(keymap));
         let policy = wallet_desc
             .extract_policy(&signers_container, &Secp256k1::new())
@@ -1024,10 +1088,14 @@ mod test {
 
     #[test]
     fn test_extract_policy_for_single_wpkh() {
+        let secp = Secp256k1::new();
+
         let (prvkey, pubkey, fingerprint) = setup_keys(TPRV0_STR);
         let desc = descriptor!(wpkh(pubkey)).unwrap();
-        let (wallet_desc, keymap) = desc.to_wallet_descriptor(Network::Testnet).unwrap();
-        let single_key = wallet_desc.derive(ChildNumber::from_normal_idx(0).unwrap());
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
+        let single_key = wallet_desc.derive(0);
         let signers_container = Arc::new(SignersContainer::from(keymap));
         let policy = single_key
             .extract_policy(&signers_container, &Secp256k1::new())
@@ -1040,8 +1108,10 @@ mod test {
         assert!(matches!(&policy.contribution, Satisfaction::None));
 
         let desc = descriptor!(wpkh(prvkey)).unwrap();
-        let (wallet_desc, keymap) = desc.to_wallet_descriptor(Network::Testnet).unwrap();
-        let single_key = wallet_desc.derive(ChildNumber::from_normal_idx(0).unwrap());
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
+        let single_key = wallet_desc.derive(0);
         let signers_container = Arc::new(SignersContainer::from(keymap));
         let policy = single_key
             .extract_policy(&signers_container, &Secp256k1::new())
@@ -1058,12 +1128,17 @@ mod test {
 
     // single key, 1 prv and 1 pub key descriptor, required 1 prv keys
     #[test]
+    #[ignore] // see https://github.com/bitcoindevkit/bdk/issues/225
     fn test_extract_policy_for_single_wsh_multi_complete_1of2() {
+        let secp = Secp256k1::new();
+
         let (_prvkey0, pubkey0, fingerprint0) = setup_keys(TPRV0_STR);
         let (prvkey1, _pubkey1, fingerprint1) = setup_keys(TPRV1_STR);
-        let desc = descriptor!(sh(multi 1, pubkey0, prvkey1)).unwrap();
-        let (wallet_desc, keymap) = desc.to_wallet_descriptor(Network::Testnet).unwrap();
-        let single_key = wallet_desc.derive(ChildNumber::from_normal_idx(0).unwrap());
+        let desc = descriptor!(sh(multi(1, pubkey0, prvkey1))).unwrap();
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
+        let single_key = wallet_desc.derive(0);
         let signers_container = Arc::new(SignersContainer::from(keymap));
         let policy = single_key
             .extract_policy(&signers_container, &Secp256k1::new())
@@ -1088,16 +1163,25 @@ mod test {
     // test ExtractPolicy trait with descriptors containing timelocks in a thresh()
 
     #[test]
+    #[ignore] // see https://github.com/bitcoindevkit/bdk/issues/225
     fn test_extract_policy_for_wsh_multi_timelock() {
+        let secp = Secp256k1::new();
+
         let (prvkey0, _pubkey0, _fingerprint0) = setup_keys(TPRV0_STR);
         let (_prvkey1, pubkey1, _fingerprint1) = setup_keys(TPRV1_STR);
         let sequence = 50;
-        let desc = descriptor!(wsh (
-            thresh 2, (pk prvkey0), (+s pk pubkey1), (+s+d+v older sequence)
-        ))
+        #[rustfmt::skip]
+        let desc = descriptor!(wsh(thresh(
+            2,
+            pk(prvkey0),
+            s:pk(pubkey1),
+            s:d:v:older(sequence)
+        )))
         .unwrap();
 
-        let (wallet_desc, keymap) = desc.to_wallet_descriptor(Network::Testnet).unwrap();
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
         let signers_container = Arc::new(SignersContainer::from(keymap));
         let policy = wallet_desc
             .extract_policy(&signers_container, &Secp256k1::new())
@@ -1174,4 +1258,50 @@ mod test {
     //
     //     // TODO how should this merge timelocks?
     // }
+
+    #[test]
+    fn test_get_condition_multisig() {
+        let secp = Secp256k1::gen_new();
+
+        let (_, pk0, _) = setup_keys(TPRV0_STR);
+        let (_, pk1, _) = setup_keys(TPRV1_STR);
+
+        let desc = descriptor!(wsh(multi(1, pk0, pk1))).unwrap();
+        let (wallet_desc, keymap) = desc
+            .into_wallet_descriptor(&secp, Network::Testnet)
+            .unwrap();
+        let signers = keymap.into();
+
+        let policy = wallet_desc
+            .extract_policy(&signers, &secp)
+            .unwrap()
+            .unwrap();
+
+        // no args, choose the default
+        let no_args = policy.get_condition(&vec![].into_iter().collect());
+        assert_eq!(no_args, Ok(Condition::default()));
+
+        // enough args
+        let eq_thresh =
+            policy.get_condition(&vec![(policy.id.clone(), vec![0])].into_iter().collect());
+        assert_eq!(eq_thresh, Ok(Condition::default()));
+
+        // more args, it doesn't really change anything
+        let gt_thresh =
+            policy.get_condition(&vec![(policy.id.clone(), vec![0, 1])].into_iter().collect());
+        assert_eq!(gt_thresh, Ok(Condition::default()));
+
+        // not enough args, error
+        let lt_thresh =
+            policy.get_condition(&vec![(policy.id.clone(), vec![])].into_iter().collect());
+        assert_eq!(
+            lt_thresh,
+            Err(PolicyError::NotEnoughItemsSelected(policy.id.clone()))
+        );
+
+        // index out of range
+        let out_of_range =
+            policy.get_condition(&vec![(policy.id.clone(), vec![5])].into_iter().collect());
+        assert_eq!(out_of_range, Err(PolicyError::IndexOutOfRange(5)));
+    }
 }

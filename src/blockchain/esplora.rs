@@ -47,10 +47,10 @@ use serde::Deserialize;
 
 use reqwest::{Client, StatusCode};
 
-use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::hashes::hex::ToHex;
+use bitcoin::consensus::{self, deserialize, serialize};
+use bitcoin::hashes::hex::{FromHex, ToHex};
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::{BlockHash, BlockHeader, Script, Transaction, TxMerkleNode, Txid};
+use bitcoin::{BlockHash, BlockHeader, Script, Transaction, Txid};
 
 use self::utils::{ELSGetHistoryRes, ElectrumLikeSync};
 use super::*;
@@ -190,13 +190,13 @@ impl UrlClient {
 
         let resp = self
             .client
-            .get(&format!("{}/block/{}", self.url, hash))
+            .get(&format!("{}/block/{}/header", self.url, hash))
             .send()
             .await?;
 
-        let esplora_header = resp.json::<EsploraHeader>().await?;
+        let header = deserialize(&Vec::from_hex(&resp.text().await?)?)?;
 
-        Ok(esplora_header.into())
+        Ok(header)
     }
 
     async fn _broadcast(&self, transaction: &Transaction) -> Result<(), EsploraError> {
@@ -373,39 +373,14 @@ struct EsploraGetHistory {
     status: EsploraGetHistoryStatus,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
-pub struct EsploraHeader {
-    pub id: String,
-    pub height: u32,
-    pub version: i32,
-    pub timestamp: u32,
-    pub tx_count: u32,
-    pub size: u32,
-    pub weight: u32,
-    pub merkle_root: TxMerkleNode,
-    pub previousblockhash: BlockHash,
-    pub nonce: u32,
-    pub bits: u32,
-    pub difficulty: u32,
-}
-
-impl Into<BlockHeader> for EsploraHeader {
-    fn into(self) -> BlockHeader {
-        BlockHeader {
-            version: self.version,
-            prev_blockhash: self.previousblockhash,
-            merkle_root: self.merkle_root,
-            time: self.timestamp,
-            bits: self.bits,
-            nonce: self.nonce,
-        }
-    }
-}
-
 /// Configuration for an [`EsploraBlockchain`]
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct EsploraBlockchainConfig {
+    /// Base URL of the esplora service
+    ///
+    /// eg. `https://blockstream.info/api/`
     pub base_url: String,
+    /// Number of parallel requests sent to the esplora service (default: 4)
     pub concurrency: Option<u8>,
 }
 
@@ -429,6 +404,8 @@ pub enum EsploraError {
     Parsing(std::num::ParseIntError),
     /// Invalid Bitcoin data returned
     BitcoinEncoding(bitcoin::consensus::encode::Error),
+    /// Invalid Hex data returned
+    Hex(bitcoin::hashes::hex::Error),
 
     /// Transaction not found
     TransactionNotFound(Txid),
@@ -446,39 +423,7 @@ impl fmt::Display for EsploraError {
 
 impl std::error::Error for EsploraError {}
 
-impl From<reqwest::Error> for EsploraError {
-    fn from(other: reqwest::Error) -> Self {
-        EsploraError::Reqwest(other)
-    }
-}
-
-impl From<std::num::ParseIntError> for EsploraError {
-    fn from(other: std::num::ParseIntError) -> Self {
-        EsploraError::Parsing(other)
-    }
-}
-
-impl From<bitcoin::consensus::encode::Error> for EsploraError {
-    fn from(other: bitcoin::consensus::encode::Error) -> Self {
-        EsploraError::BitcoinEncoding(other)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::blockchain::esplora::EsploraHeader;
-    use bitcoin::hashes::hex::FromHex;
-    use bitcoin::{BlockHash, BlockHeader};
-
-    #[test]
-    fn test_esplora_header() {
-        let json_str = r#"{"id":"00000000b873e79784647a6c82962c70d228557d24a747ea4d1b8bbe878e1206","height":1,"version":1,"timestamp":1296688928,"tx_count":1,"size":190,"weight":760,"merkle_root":"f0315ffc38709d70ad5647e22048358dd3745f3ce3874223c80a7c92fab0c8ba","previousblockhash":"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943","nonce":1924588547,"bits":486604799,"difficulty":1}"#;
-        let json: EsploraHeader = serde_json::from_str(&json_str).unwrap();
-        let header: BlockHeader = json.into();
-        assert_eq!(
-            header.block_hash(),
-            BlockHash::from_hex("00000000b873e79784647a6c82962c70d228557d24a747ea4d1b8bbe878e1206")
-                .unwrap()
-        );
-    }
-}
+impl_error!(reqwest::Error, Reqwest, EsploraError);
+impl_error!(std::num::ParseIntError, Parsing, EsploraError);
+impl_error!(consensus::encode::Error, BitcoinEncoding, EsploraError);
+impl_error!(bitcoin::hashes::hex::Error, Hex, EsploraError);

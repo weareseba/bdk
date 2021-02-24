@@ -37,6 +37,8 @@
 //! connecting to a single peer at a time, optionally by opening multiple connections if it's
 //! desirable to use multiple threads at once to sync in parallel.
 //!
+//! This is an **EXPERIMENTAL** feature, API and other major changes are expected.
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -48,11 +50,13 @@
 //!
 //! let mempool = Arc::new(Mempool::default());
 //! let peers = (0..num_threads)
-//!     .map(|_| Peer::connect(
-//!         "btcd-mainnet.lightning.computer:8333",
-//!         Arc::clone(&mempool),
-//!         Network::Bitcoin,
-//!     ))
+//!     .map(|_| {
+//!         Peer::connect(
+//!             "btcd-mainnet.lightning.computer:8333",
+//!             Arc::clone(&mempool),
+//!             Network::Bitcoin,
+//!         )
+//!     })
 //!     .collect::<Result<_, _>>()?;
 //! let blockchain = CompactFiltersBlockchain::new(peers, "./wallet-filters", Some(500_000))?;
 //! # Ok::<(), CompactFiltersError>(())
@@ -79,7 +83,7 @@ mod sync;
 use super::{Blockchain, Capability, ConfigurableBlockchain, Progress};
 use crate::database::{BatchDatabase, BatchOperations, DatabaseUtils};
 use crate::error::Error;
-use crate::types::{ScriptType, TransactionDetails, UTXO};
+use crate::types::{KeychainKind, TransactionDetails, UTXO};
 use crate::FeeRate;
 
 use peer::*;
@@ -127,7 +131,7 @@ impl CompactFiltersBlockchain {
 
         let network = peers[0].get_network();
 
-        let cfs = DB::list_cf(&opts, &storage_dir).unwrap_or(vec!["default".to_string()]);
+        let cfs = DB::list_cf(&opts, &storage_dir).unwrap_or_else(|_| vec!["default".to_string()]);
         let db = DB::open_cf(&opts, &storage_dir, &cfs)?;
         let headers = Arc::new(ChainStore::new(db, network)?);
 
@@ -186,22 +190,22 @@ impl CompactFiltersBlockchain {
             outputs_sum += output.value;
 
             // this output is ours, we have a path to derive it
-            if let Some((script_type, child)) =
+            if let Some((keychain, child)) =
                 database.get_path_from_script_pubkey(&output.script_pubkey)?
             {
                 debug!("{} output #{} is mine, adding utxo", tx.txid(), i);
                 updates.set_utxo(&UTXO {
                     outpoint: OutPoint::new(tx.txid(), i as u32),
                     txout: output.clone(),
-                    is_internal: script_type.is_internal(),
+                    keychain,
                 })?;
                 incoming += output.value;
 
-                if script_type == ScriptType::Internal
+                if keychain == KeychainKind::Internal
                     && (internal_max_deriv.is_none() || child > internal_max_deriv.unwrap_or(0))
                 {
                     *internal_max_deriv = Some(child);
-                } else if script_type == ScriptType::External
+                } else if keychain == KeychainKind::External
                     && (external_max_deriv.is_none() || child > external_max_deriv.unwrap_or(0))
                 {
                     *external_max_deriv = Some(child);
@@ -217,7 +221,7 @@ impl CompactFiltersBlockchain {
                 sent: outgoing,
                 height,
                 timestamp,
-                fees: inputs_sum.checked_sub(outputs_sum).unwrap_or(0),
+                fees: inputs_sum.saturating_sub(outputs_sum),
             };
 
             info!("Saving tx {}", tx.txid);
@@ -253,13 +257,10 @@ impl Blockchain for CompactFiltersBlockchain {
             .map(|x| x / 1000)
             .unwrap_or(0)
             + 1;
-        let expected_bundles_to_sync = total_bundles
-            .checked_sub(cf_sync.pruned_bundles()?)
-            .unwrap_or(0);
+        let expected_bundles_to_sync = total_bundles.saturating_sub(cf_sync.pruned_bundles()?);
 
         let headers_cost = (first_peer.get_version().start_height as usize)
-            .checked_sub(initial_height)
-            .unwrap_or(0) as f32
+            .saturating_sub(initial_height) as f32
             * SYNC_HEADERS_COST;
         let filters_cost = expected_bundles_to_sync as f32 * SYNC_FILTERS_COST;
 
@@ -270,7 +271,7 @@ impl Blockchain for CompactFiltersBlockchain {
             Arc::clone(&self.headers),
             |new_height| {
                 let local_headers_cost =
-                    new_height.checked_sub(initial_height).unwrap_or(0) as f32 * SYNC_HEADERS_COST;
+                    new_height.saturating_sub(initial_height) as f32 * SYNC_HEADERS_COST;
                 progress_update.update(
                     local_headers_cost / total_cost * 100.0,
                     Some(format!("Synced headers to {}", new_height)),
@@ -284,9 +285,7 @@ impl Blockchain for CompactFiltersBlockchain {
         }
 
         let synced_height = self.headers.get_height()?;
-        let buried_height = synced_height
-            .checked_sub(sync::BURIED_CONFIRMATIONS)
-            .unwrap_or(0);
+        let buried_height = synced_height.saturating_sub(sync::BURIED_CONFIRMATIONS);
         info!("Synced headers to height: {}", synced_height);
 
         cf_sync.prepare_sync(Arc::clone(&first_peer))?;
@@ -299,7 +298,9 @@ impl Blockchain for CompactFiltersBlockchain {
                 .collect::<Vec<_>>(),
         );
 
+        #[allow(clippy::mutex_atomic)]
         let last_synced_block = Arc::new(Mutex::new(synced_height));
+
         let synced_bundles = Arc::new(AtomicUsize::new(0));
         let progress_update = Arc::new(Mutex::new(progress_update));
 
@@ -324,10 +325,7 @@ impl Blockchain for CompactFiltersBlockchain {
                         }
 
                         let block_height = headers.get_height_for(block_hash)?.unwrap_or(0);
-                        let saved_correct_block = match headers.get_full_block(block_height)? {
-                            Some(block) if &block.block_hash() == block_hash => true,
-                            _ => false,
-                        };
+                        let saved_correct_block = matches!(headers.get_full_block(block_height)?, Some(block) if &block.block_hash() == block_hash);
 
                         if saved_correct_block {
                             Ok(false)
@@ -385,7 +383,12 @@ impl Blockchain for CompactFiltersBlockchain {
         }
         database.commit_batch(updates)?;
 
-        first_peer.ask_for_mempool()?;
+        match first_peer.ask_for_mempool() {
+            Err(CompactFiltersError::PeerBloomDisabled) => {
+                log::warn!("Peer has BLOOM disabled, we can't ask for the mempool")
+            }
+            e => e?,
+        };
 
         let mut internal_max_deriv = None;
         let mut external_max_deriv = None;
@@ -413,18 +416,22 @@ impl Blockchain for CompactFiltersBlockchain {
             )?;
         }
 
-        let current_ext = database.get_last_index(ScriptType::External)?.unwrap_or(0);
+        let current_ext = database
+            .get_last_index(KeychainKind::External)?
+            .unwrap_or(0);
         let first_ext_new = external_max_deriv.map(|x| x + 1).unwrap_or(0);
         if first_ext_new > current_ext {
             info!("Setting external index to {}", first_ext_new);
-            database.set_last_index(ScriptType::External, first_ext_new)?;
+            database.set_last_index(KeychainKind::External, first_ext_new)?;
         }
 
-        let current_int = database.get_last_index(ScriptType::Internal)?.unwrap_or(0);
+        let current_int = database
+            .get_last_index(KeychainKind::Internal)?
+            .unwrap_or(0);
         let first_int_new = internal_max_deriv.map(|x| x + 1).unwrap_or(0);
         if first_int_new > current_int {
             info!("Setting internal index to {}", first_int_new);
-            database.set_last_index(ScriptType::Internal, first_int_new)?;
+            database.set_last_index(KeychainKind::Internal, first_int_new)?;
         }
 
         info!("Dropping blocks until {}", buried_height);
@@ -463,17 +470,24 @@ impl Blockchain for CompactFiltersBlockchain {
 /// Data to connect to a Bitcoin P2P peer
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct BitcoinPeerConfig {
+    /// Peer address such as 127.0.0.1:18333
     pub address: String,
+    /// Optional socks5 proxy
     pub socks5: Option<String>,
+    /// Optional socks5 proxy credentials
     pub socks5_credentials: Option<(String, String)>,
 }
 
 /// Configuration for a [`CompactFiltersBlockchain`]
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct CompactFiltersBlockchainConfig {
+    /// List of peers to try to connect to for asking headers and filters
     pub peers: Vec<BitcoinPeerConfig>,
+    /// Network used
     pub network: Network,
+    /// Storage dir to save partially downloaded headers and full blocks
     pub storage_dir: String,
+    /// Optionally skip initial `skip_blocks` blocks (default: 0)
     pub skip_blocks: Option<usize>,
 }
 
@@ -528,6 +542,8 @@ pub enum CompactFiltersError {
     NotConnected,
     /// A peer took too long to reply to one of our messages
     Timeout,
+    /// The peer doesn't advertise the [`BLOOM`](bitcoin::network::constants::ServiceFlags::BLOOM) service flag
+    PeerBloomDisabled,
 
     /// No peers have been specified
     NoPeers,
@@ -553,20 +569,10 @@ impl fmt::Display for CompactFiltersError {
 
 impl std::error::Error for CompactFiltersError {}
 
-macro_rules! impl_error {
-    ( $from:ty, $to:ident ) => {
-        impl std::convert::From<$from> for CompactFiltersError {
-            fn from(err: $from) -> Self {
-                CompactFiltersError::$to(err)
-            }
-        }
-    };
-}
-
-impl_error!(rocksdb::Error, DB);
-impl_error!(std::io::Error, IO);
-impl_error!(bitcoin::util::bip158::Error, BIP158);
-impl_error!(std::time::SystemTimeError, Time);
+impl_error!(rocksdb::Error, DB, CompactFiltersError);
+impl_error!(std::io::Error, IO, CompactFiltersError);
+impl_error!(bitcoin::util::bip158::Error, BIP158, CompactFiltersError);
+impl_error!(std::time::SystemTimeError, Time, CompactFiltersError);
 
 impl From<crate::error::Error> for CompactFiltersError {
     fn from(err: crate::error::Error) -> Self {

@@ -29,19 +29,19 @@
 //!
 //! ## Example
 //!
-//! In this example, `wallet_memory` and `wallet_sled` have the same type of `Wallet<OfflineBlockchain, AnyDatabase>`.
+//! In this example, `wallet_memory` and `wallet_sled` have the same type of `Wallet<(), AnyDatabase>`.
 //!
 //! ```no_run
 //! # use bitcoin::Network;
 //! # use bdk::database::{AnyDatabase, MemoryDatabase};
-//! # use bdk::{Wallet, OfflineWallet};
-//! let memory = MemoryDatabase::default().into();
-//! let wallet_memory: OfflineWallet<AnyDatabase> = Wallet::new_offline("...", None, Network::Testnet, memory)?;
+//! # use bdk::{Wallet};
+//! let memory = MemoryDatabase::default();
+//! let wallet_memory = Wallet::new_offline("...", None, Network::Testnet, memory)?;
 //!
 //! # #[cfg(feature = "key-value-db")]
 //! # {
-//! let sled = sled::open("my-database")?.open_tree("default_tree")?.into();
-//! let wallet_sled: OfflineWallet<AnyDatabase> = Wallet::new_offline("...", None, Network::Testnet, sled)?;
+//! let sled = sled::open("my-database")?.open_tree("default_tree")?;
+//! let wallet_sled = Wallet::new_offline("...", None, Network::Testnet, sled)?;
 //! # }
 //! # Ok::<(), bdk::Error>(())
 //! ```
@@ -52,10 +52,10 @@
 //! ```no_run
 //! # use bitcoin::Network;
 //! # use bdk::database::*;
-//! # use bdk::{Wallet, OfflineWallet};
+//! # use bdk::{Wallet};
 //! let config = serde_json::from_str("...")?;
 //! let database = AnyDatabase::from_config(&config)?;
-//! let wallet: OfflineWallet<_> = Wallet::new_offline("...", None, Network::Testnet, database)?;
+//! let wallet = Wallet::new_offline("...", None, Network::Testnet, database)?;
 //! # Ok::<(), bdk::Error>(())
 //! ```
 
@@ -89,9 +89,11 @@ macro_rules! impl_inner_method {
 /// See [this module](crate::database::any)'s documentation for a usage example.
 #[derive(Debug)]
 pub enum AnyDatabase {
+    /// In-memory ephemeral database
     Memory(memory::MemoryDatabase),
     #[cfg(feature = "key-value-db")]
     #[cfg_attr(docsrs, doc(cfg(feature = "key-value-db")))]
+    /// Simple key-value embedded database based on [`sled`]
     Sled(sled::Tree),
 }
 
@@ -100,9 +102,11 @@ impl_from!(sled::Tree, AnyDatabase, Sled, #[cfg(feature = "key-value-db")]);
 
 /// Type that contains any of the [`BatchDatabase::Batch`] types defined by the library
 pub enum AnyBatch {
+    /// In-memory ephemeral database
     Memory(<memory::MemoryDatabase as BatchDatabase>::Batch),
     #[cfg(feature = "key-value-db")]
     #[cfg_attr(docsrs, doc(cfg(feature = "key-value-db")))]
+    /// Simple key-value embedded database based on [`sled`]
     Sled(<sled::Tree as BatchDatabase>::Batch),
 }
 
@@ -117,7 +121,7 @@ impl BatchOperations for AnyDatabase {
     fn set_script_pubkey(
         &mut self,
         script: &Script,
-        script_type: ScriptType,
+        keychain: KeychainKind,
         child: u32,
     ) -> Result<(), Error> {
         impl_inner_method!(
@@ -125,7 +129,7 @@ impl BatchOperations for AnyDatabase {
             self,
             set_script_pubkey,
             script,
-            script_type,
+            keychain,
             child
         )
     }
@@ -138,27 +142,27 @@ impl BatchOperations for AnyDatabase {
     fn set_tx(&mut self, transaction: &TransactionDetails) -> Result<(), Error> {
         impl_inner_method!(AnyDatabase, self, set_tx, transaction)
     }
-    fn set_last_index(&mut self, script_type: ScriptType, value: u32) -> Result<(), Error> {
-        impl_inner_method!(AnyDatabase, self, set_last_index, script_type, value)
+    fn set_last_index(&mut self, keychain: KeychainKind, value: u32) -> Result<(), Error> {
+        impl_inner_method!(AnyDatabase, self, set_last_index, keychain, value)
     }
 
     fn del_script_pubkey_from_path(
         &mut self,
-        script_type: ScriptType,
+        keychain: KeychainKind,
         child: u32,
     ) -> Result<Option<Script>, Error> {
         impl_inner_method!(
             AnyDatabase,
             self,
             del_script_pubkey_from_path,
-            script_type,
+            keychain,
             child
         )
     }
     fn del_path_from_script_pubkey(
         &mut self,
         script: &Script,
-    ) -> Result<Option<(ScriptType, u32)>, Error> {
+    ) -> Result<Option<(KeychainKind, u32)>, Error> {
         impl_inner_method!(AnyDatabase, self, del_path_from_script_pubkey, script)
     }
     fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
@@ -174,28 +178,28 @@ impl BatchOperations for AnyDatabase {
     ) -> Result<Option<TransactionDetails>, Error> {
         impl_inner_method!(AnyDatabase, self, del_tx, txid, include_raw)
     }
-    fn del_last_index(&mut self, script_type: ScriptType) -> Result<Option<u32>, Error> {
-        impl_inner_method!(AnyDatabase, self, del_last_index, script_type)
+    fn del_last_index(&mut self, keychain: KeychainKind) -> Result<Option<u32>, Error> {
+        impl_inner_method!(AnyDatabase, self, del_last_index, keychain)
     }
 }
 
 impl Database for AnyDatabase {
     fn check_descriptor_checksum<B: AsRef<[u8]>>(
         &mut self,
-        script_type: ScriptType,
+        keychain: KeychainKind,
         bytes: B,
     ) -> Result<(), Error> {
         impl_inner_method!(
             AnyDatabase,
             self,
             check_descriptor_checksum,
-            script_type,
+            keychain,
             bytes
         )
     }
 
-    fn iter_script_pubkeys(&self, script_type: Option<ScriptType>) -> Result<Vec<Script>, Error> {
-        impl_inner_method!(AnyDatabase, self, iter_script_pubkeys, script_type)
+    fn iter_script_pubkeys(&self, keychain: Option<KeychainKind>) -> Result<Vec<Script>, Error> {
+        impl_inner_method!(AnyDatabase, self, iter_script_pubkeys, keychain)
     }
     fn iter_utxos(&self) -> Result<Vec<UTXO>, Error> {
         impl_inner_method!(AnyDatabase, self, iter_utxos)
@@ -209,21 +213,21 @@ impl Database for AnyDatabase {
 
     fn get_script_pubkey_from_path(
         &self,
-        script_type: ScriptType,
+        keychain: KeychainKind,
         child: u32,
     ) -> Result<Option<Script>, Error> {
         impl_inner_method!(
             AnyDatabase,
             self,
             get_script_pubkey_from_path,
-            script_type,
+            keychain,
             child
         )
     }
     fn get_path_from_script_pubkey(
         &self,
         script: &Script,
-    ) -> Result<Option<(ScriptType, u32)>, Error> {
+    ) -> Result<Option<(KeychainKind, u32)>, Error> {
         impl_inner_method!(AnyDatabase, self, get_path_from_script_pubkey, script)
     }
     fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
@@ -235,12 +239,12 @@ impl Database for AnyDatabase {
     fn get_tx(&self, txid: &Txid, include_raw: bool) -> Result<Option<TransactionDetails>, Error> {
         impl_inner_method!(AnyDatabase, self, get_tx, txid, include_raw)
     }
-    fn get_last_index(&self, script_type: ScriptType) -> Result<Option<u32>, Error> {
-        impl_inner_method!(AnyDatabase, self, get_last_index, script_type)
+    fn get_last_index(&self, keychain: KeychainKind) -> Result<Option<u32>, Error> {
+        impl_inner_method!(AnyDatabase, self, get_last_index, keychain)
     }
 
-    fn increment_last_index(&mut self, script_type: ScriptType) -> Result<u32, Error> {
-        impl_inner_method!(AnyDatabase, self, increment_last_index, script_type)
+    fn increment_last_index(&mut self, keychain: KeychainKind) -> Result<u32, Error> {
+        impl_inner_method!(AnyDatabase, self, increment_last_index, keychain)
     }
 }
 
@@ -248,17 +252,10 @@ impl BatchOperations for AnyBatch {
     fn set_script_pubkey(
         &mut self,
         script: &Script,
-        script_type: ScriptType,
+        keychain: KeychainKind,
         child: u32,
     ) -> Result<(), Error> {
-        impl_inner_method!(
-            AnyBatch,
-            self,
-            set_script_pubkey,
-            script,
-            script_type,
-            child
-        )
+        impl_inner_method!(AnyBatch, self, set_script_pubkey, script, keychain, child)
     }
     fn set_utxo(&mut self, utxo: &UTXO) -> Result<(), Error> {
         impl_inner_method!(AnyBatch, self, set_utxo, utxo)
@@ -269,27 +266,21 @@ impl BatchOperations for AnyBatch {
     fn set_tx(&mut self, transaction: &TransactionDetails) -> Result<(), Error> {
         impl_inner_method!(AnyBatch, self, set_tx, transaction)
     }
-    fn set_last_index(&mut self, script_type: ScriptType, value: u32) -> Result<(), Error> {
-        impl_inner_method!(AnyBatch, self, set_last_index, script_type, value)
+    fn set_last_index(&mut self, keychain: KeychainKind, value: u32) -> Result<(), Error> {
+        impl_inner_method!(AnyBatch, self, set_last_index, keychain, value)
     }
 
     fn del_script_pubkey_from_path(
         &mut self,
-        script_type: ScriptType,
+        keychain: KeychainKind,
         child: u32,
     ) -> Result<Option<Script>, Error> {
-        impl_inner_method!(
-            AnyBatch,
-            self,
-            del_script_pubkey_from_path,
-            script_type,
-            child
-        )
+        impl_inner_method!(AnyBatch, self, del_script_pubkey_from_path, keychain, child)
     }
     fn del_path_from_script_pubkey(
         &mut self,
         script: &Script,
-    ) -> Result<Option<(ScriptType, u32)>, Error> {
+    ) -> Result<Option<(KeychainKind, u32)>, Error> {
         impl_inner_method!(AnyBatch, self, del_path_from_script_pubkey, script)
     }
     fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
@@ -305,8 +296,8 @@ impl BatchOperations for AnyBatch {
     ) -> Result<Option<TransactionDetails>, Error> {
         impl_inner_method!(AnyBatch, self, del_tx, txid, include_raw)
     }
-    fn del_last_index(&mut self, script_type: ScriptType) -> Result<Option<u32>, Error> {
-        impl_inner_method!(AnyBatch, self, del_last_index, script_type)
+    fn del_last_index(&mut self, keychain: KeychainKind) -> Result<Option<u32>, Error> {
+        impl_inner_method!(AnyBatch, self, del_last_index, keychain)
     }
 }
 
@@ -347,7 +338,9 @@ impl BatchDatabase for AnyDatabase {
 #[cfg(feature = "key-value-db")]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SledDbConfiguration {
+    /// Main directory of the db
     pub path: String,
+    /// Name of the database tree, a separated namespace for the data
     pub tree_name: String,
 }
 
@@ -367,9 +360,11 @@ impl ConfigurableDatabase for sled::Tree {
 /// will find this particularly useful.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum AnyDatabaseConfig {
+    /// Memory database has no config
     Memory(()),
     #[cfg(feature = "key-value-db")]
     #[cfg_attr(docsrs, doc(cfg(feature = "key-value-db")))]
+    /// Simple key-value embedded database based on [`sled`]
     Sled(SledDbConfiguration),
 }
 

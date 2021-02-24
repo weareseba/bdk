@@ -1,40 +1,47 @@
 [package]
 name = "bdk"
-version = "0.1.0"
+version = "0.4.1-dev"
 edition = "2018"
 authors = ["Alekos Filini <alekos.filini@gmail.com>", "Riccardo Casatta <riccardo@casatta.it>"]
+homepage = "https://bitcoindevkit.org"
+repository = "https://github.com/bitcoindevkit/bdk"
+documentation = "https://docs.rs/bdk"
+description = "A modern, lightweight, descriptor-based wallet library"
+keywords = ["bitcoin", "wallet", "descriptor", "psbt"]
+readme = "README.md"
+license = "MIT"
 
 [dependencies]
-bdk-macros = { version = "0.1.0-beta.1", path = "./macros" }
+bdk-macros = "^0.3"
 log = "^0.4"
-miniscript = "4.0"
-bitcoin = { version = "^0.25.2", features = ["use-serde"] }
+miniscript = "5.1"
+bitcoin = { version = "^0.26", features = ["use-serde"] }
 bitcoin_hashes = "^0.9"
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 rand = "^0.7"
 base64 = "^0.11"
-bitcoinconsensus = "0.19.0-2"
+bitcoinconsensus = "0.17.1"
 
 # Optional dependencies
 sled = { version = "0.34", optional = true }
-electrum-client = { version = "0.3.0-beta.1", optional = true }
-reqwest = { version = "0.10", optional = true, features = ["json"] }
+electrum-client = { version = "0.6", optional = true }
+reqwest = { version = "0.11", optional = true, features = ["json"] }
 futures = { version = "0.3", optional = true }
 clap = { version = "2.33", optional = true }
-#base64 = { version = "^0.11", optional = true }
 async-trait = { version = "0.1", optional = true }
 rocksdb = { version = "0.14", optional = true }
-# pin cc version to 1.0.62 because 1.0.63 break rocksdb build
 # pin cc version to 1.0.41 as used by bitcoinsensus
-cc = { version = "=1.0.41", optional = true }
+#cc = { version = "=1.0.41", optional = true }
+# pin cc version to 1.0.62 because 1.0.63 break rocksdb build
+cc = { version = ">=1.0.64", optional = true }
 socks = { version = "0.3", optional = true }
 lazy_static = { version = "1.4", optional = true }
 tiny-bip39 = { version = "^0.8", optional = true }
 
 # Platform-specific dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "0.2", features = ["rt-core"] }
+tokio = { version = "1", features = ["rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 async-trait = "0.1"
@@ -43,13 +50,12 @@ rand = { version = "^0.7", features = ["wasm-bindgen"] }
 
 [features]
 minimal = []
-compiler = ["clap", "miniscript/compiler"]
+compiler = ["miniscript/compiler"]
 default = ["key-value-db", "electrum"]
 electrum = ["electrum-client"]
 esplora = ["reqwest", "futures"]
 compact_filters = ["rocksdb", "socks", "lazy_static", "cc"]
 key-value-db = ["sled"]
-#cli-utils = ["clap", "base64"]
 cli-utils = ["clap"]
 async-interface = ["async-trait"]
 all-keys = ["keys-bip39"]
@@ -61,23 +67,19 @@ test-electrum = ["electrum"]
 test-md-docs = ["electrum"]
 
 [dev-dependencies]
-bdk-testutils = { version = "0.1.0-beta.1", path = "./testutils" }
-bdk-testutils-macros = { version = "0.1.0-beta.1", path = "./testutils-macros" }
+bdk-testutils = { path = "./testutils"}
+bdk-testutils-macros = { path = "./testutils-macros"}
 serial_test = "0.4"
 lazy_static = "1.4"
-rustyline = "6.0"
-dirs-next = "2.0"
 env_logger = "0.7"
 rstest = "0.6.4"
 tiny-bip39 = "^0.7"
 
 [[example]]
-name = "repl"
-required-features = ["cli-utils", "esplora"]
-[[example]]
-name = "parse_descriptor"
-[[example]]
 name = "address_validator"
+[[example]]
+name = "compact_filters_balance"
+required-features = ["compact_filters"]
 
 [[example]]
 name = "miniscriptc"

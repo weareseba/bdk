@@ -40,7 +40,7 @@
 //! # use bdk::Wallet;
 //! # #[cfg(feature = "electrum")]
 //! # {
-//! let electrum_blockchain = ElectrumBlockchain::from(electrum_client::Client::new("...", None)?);
+//! let electrum_blockchain = ElectrumBlockchain::from(electrum_client::Client::new("...")?);
 //! let wallet_electrum: Wallet<AnyBlockchain, _> = Wallet::new(
 //!     "...",
 //!     None,
@@ -75,7 +75,13 @@
 //! # use bdk::Wallet;
 //! let config = serde_json::from_str("...")?;
 //! let blockchain = AnyBlockchain::from_config(&config)?;
-//! let wallet = Wallet::new("...", None, Network::Testnet, MemoryDatabase::default(), blockchain)?;
+//! let wallet = Wallet::new(
+//!     "...",
+//!     None,
+//!     Network::Testnet,
+//!     MemoryDatabase::default(),
+//!     blockchain,
+//! )?;
 //! # Ok::<(), bdk::Error>(())
 //! ```
 
@@ -113,12 +119,15 @@ macro_rules! impl_inner_method {
 pub enum AnyBlockchain {
     #[cfg(feature = "electrum")]
     #[cfg_attr(docsrs, doc(cfg(feature = "electrum")))]
+    /// Electrum client
     Electrum(electrum::ElectrumBlockchain),
     #[cfg(feature = "esplora")]
     #[cfg_attr(docsrs, doc(cfg(feature = "esplora")))]
+    /// Esplora client
     Esplora(esplora::EsploraBlockchain),
     #[cfg(feature = "compact_filters")]
     #[cfg_attr(docsrs, doc(cfg(feature = "compact_filters")))]
+    /// Compact filters client
     CompactFilters(compact_filters::CompactFiltersBlockchain),
 }
 
@@ -185,12 +194,15 @@ impl_from!(compact_filters::CompactFiltersBlockchain, AnyBlockchain, CompactFilt
 pub enum AnyBlockchainConfig {
     #[cfg(feature = "electrum")]
     #[cfg_attr(docsrs, doc(cfg(feature = "electrum")))]
+    /// Electrum client
     Electrum(electrum::ElectrumBlockchainConfig),
     #[cfg(feature = "esplora")]
     #[cfg_attr(docsrs, doc(cfg(feature = "esplora")))]
+    /// Esplora client
     Esplora(esplora::EsploraBlockchainConfig),
     #[cfg(feature = "compact_filters")]
     #[cfg_attr(docsrs, doc(cfg(feature = "compact_filters")))]
+    /// Compact filters client
     CompactFilters(compact_filters::CompactFiltersBlockchainConfig),
 }
 

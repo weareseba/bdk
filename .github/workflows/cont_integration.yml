@@ -10,7 +10,7 @@ jobs:
     strategy:
       matrix:
         rust:
-          - stable
+          - 1.50.0 # STABLE
           - 1.45.0 # MSRV
         features:
           - default
@@ -20,15 +20,8 @@ jobs:
           - key-value-db
           - electrum
           - compact_filters
-          - cli-utils,esplora,key-value-db,electrum
+          - esplora,key-value-db,electrum
           - compiler
-        include:
-          - rust: stable
-            features: compact_filters
-            clippy: skip
-          - rust: 1.45.0
-            features: compact_filters
-            clippy: skip
     steps:
       - name: checkout
         uses: actions/checkout@v2
@@ -48,25 +41,49 @@ jobs:
         run: rustup set profile minimal
       - name: Add clippy
         run: rustup component add clippy
+      - name: Update toolchain
+        run: rustup update
       - name: Build
         run: cargo build --features ${{ matrix.features }} --no-default-features
       - name: Clippy
-        if: ${{ matrix.rust == 'stable' && matrix.clippy != 'skip' }}
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --features ${{ matrix.features }} --no-default-features -- -D warnings
       - name: Test
-        if: ${{ matrix.test != 'skip' }}
         run: cargo test --features ${{ matrix.features }} --no-default-features
+
+  test-readme-examples:
+    name: Test README.md examples
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - name: cache
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-md-docs-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+      - name: Set default toolchain
+        run: rustup default nightly
+      - name: Set profile
+        run: rustup set profile minimal
+      - name: Update toolchain
+        run: rustup update
+      - name: Test
+        run: cargo test --features test-md-docs --no-default-features -- doctest::ReadmeDoctests
 
   test-electrum:
     name: Test electrum
     runs-on: ubuntu-16.04
-    container: bitcoindevkit/electrs
+    container: bitcoindevkit/electrs:0.2.0
     env:
-      MAGICAL_RPC_AUTH: USER_PASS
-      MAGICAL_RPC_USER: admin
-      MAGICAL_RPC_PASS: passw
-      MAGICAL_RPC_URL: 127.0.0.1:18443
-      MAGICAL_ELECTRUM_URL: tcp://127.0.0.1:60401
+      BDK_RPC_AUTH: USER_PASS
+      BDK_RPC_USER: admin
+      BDK_RPC_PASS: passw
+      BDK_RPC_URL: 127.0.0.1:18443
+      BDK_RPC_WALLET: bdk-test
+      BDK_ELECTRUM_URL: tcp://127.0.0.1:60401
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -81,9 +98,11 @@ jobs:
       - name: Install rustup
         run: curl https://sh.rustup.rs -sSf | sh -s -- -y
       - name: Set default toolchain
-        run: $HOME/.cargo/bin/rustup default stable
+        run: $HOME/.cargo/bin/rustup default 1.50.0 # STABLE
       - name: Set profile
         run: $HOME/.cargo/bin/rustup set profile minimal
+      - name: Update toolchain
+        run: $HOME/.cargo/bin/rustup update
       - name: Start core
         run: ./ci/start-core.sh
       - name: Test
@@ -112,13 +131,15 @@ jobs:
       - run: sudo apt-get update || exit 1
       - run: sudo apt-get install -y clang-10 libc6-dev-i386 || exit 1
       - name: Set default toolchain
-        run: rustup default stable
+        run: rustup default 1.50.0 # STABLE
       - name: Set profile
         run: rustup set profile minimal
       - name: Add target wasm32
         run: rustup target add wasm32-unknown-unknown
+      - name: Update toolchain
+        run: rustup update
       - name: Check
-        run: cargo check --target wasm32-unknown-unknown --features cli-utils,esplora --no-default-features
+        run: cargo check --target wasm32-unknown-unknown --features esplora --no-default-features
 
   fmt:
     name: Rust fmt
@@ -127,10 +148,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v2
       - name: Set default toolchain
-        run: rustup default stable
+        run: rustup default 1.50.0 # STABLE
       - name: Set profile
         run: rustup set profile minimal
       - name: Add clippy
         run: rustup component add rustfmt
+      - name: Update toolchain
+        run: rustup update
       - name: Check fmt
         run: cargo fmt --all -- --check

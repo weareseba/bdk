@@ -40,7 +40,11 @@ use log::{debug, error, info, trace};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::hex::{FromHex, ToHex};
 use bitcoin::hashes::sha256d;
-use bitcoin::{Address, Amount, Script, Transaction, Txid};
+use bitcoin::secp256k1::{Secp256k1, Verification};
+use bitcoin::{Address, Amount, PublicKey, Script, Transaction, Txid};
+
+use miniscript::descriptor::DescriptorPublicKey;
+use miniscript::{Descriptor, MiniscriptKey, TranslatePk};
 
 pub use bitcoincore_rpc::bitcoincore_rpc_json::AddressType;
 pub use bitcoincore_rpc::{Auth, Client as RpcClient, RpcApi};
@@ -49,20 +53,20 @@ pub use electrum_client::{Client as ElectrumClient, ElectrumApi};
 
 // TODO: we currently only support env vars, we could also parse a toml file
 fn get_auth() -> Auth {
-    match env::var("MAGICAL_RPC_AUTH").as_ref().map(String::as_ref) {
+    match env::var("BDK_RPC_AUTH").as_ref().map(String::as_ref) {
         Ok("USER_PASS") => Auth::UserPass(
-            env::var("MAGICAL_RPC_USER").unwrap(),
-            env::var("MAGICAL_RPC_PASS").unwrap(),
+            env::var("BDK_RPC_USER").unwrap(),
+            env::var("BDK_RPC_PASS").unwrap(),
         ),
         _ => Auth::CookieFile(PathBuf::from(
-            env::var("MAGICAL_RPC_COOKIEFILE")
+            env::var("BDK_RPC_COOKIEFILE")
                 .unwrap_or("/home/user/.bitcoin/regtest/.cookie".to_string()),
         )),
     }
 }
 
 pub fn get_electrum_url() -> String {
-    env::var("MAGICAL_ELECTRUM_URL").unwrap_or("tcp://127.0.0.1:50001".to_string())
+    env::var("BDK_ELECTRUM_URL").unwrap_or("tcp://127.0.0.1:50001".to_string())
 }
 
 pub struct TestClient {
@@ -113,23 +117,62 @@ impl TestIncomingTx {
     }
 }
 
+#[doc(hidden)]
+pub trait TranslateDescriptor {
+    // derive and translate a `Descriptor<DescriptorPublicKey>` into a `Descriptor<PublicKey>`
+    fn derive_translated<C: Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        index: u32,
+    ) -> Descriptor<PublicKey>;
+}
+
+impl TranslateDescriptor for Descriptor<DescriptorPublicKey> {
+    fn derive_translated<C: Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        index: u32,
+    ) -> Descriptor<PublicKey> {
+        let translate = |key: &DescriptorPublicKey| -> PublicKey {
+            match key {
+                DescriptorPublicKey::XPub(xpub) => {
+                    xpub.xkey
+                        .derive_pub(secp, &xpub.derivation_path)
+                        .expect("hardened derivation steps")
+                        .public_key
+                }
+                DescriptorPublicKey::SinglePub(key) => key.key,
+            }
+        };
+
+        self.derive(index)
+            .translate_pk_infallible(|pk| translate(pk), |pkh| translate(pkh).to_pubkeyhash())
+    }
+}
+
 #[macro_export]
 macro_rules! testutils {
     ( @external $descriptors:expr, $child:expr ) => ({
         use bitcoin::secp256k1::Secp256k1;
-        use miniscript::descriptor::{Descriptor, DescriptorPublicKey, DescriptorPublicKeyCtx};
+        use miniscript::descriptor::{Descriptor, DescriptorPublicKey, DescriptorTrait};
+
+        use $crate::TranslateDescriptor;
 
         let secp = Secp256k1::new();
-        let deriv_ctx = DescriptorPublicKeyCtx::new(&secp, bitcoin::util::bip32::ChildNumber::from_normal_idx(0).unwrap());
 
-        let parsed = Descriptor::<DescriptorPublicKey>::parse_descriptor(&$descriptors.0).expect("Failed to parse descriptor in `testutils!(@external)`").0;
-        parsed.derive(bitcoin::util::bip32::ChildNumber::from_normal_idx($child).unwrap()).address(bitcoin::Network::Regtest, deriv_ctx).expect("No address form")
+        let parsed = Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &$descriptors.0).expect("Failed to parse descriptor in `testutils!(@external)`").0;
+        parsed.derive_translated(&secp, $child).address(bitcoin::Network::Regtest).expect("No address form")
     });
     ( @internal $descriptors:expr, $child:expr ) => ({
-        use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
+        use bitcoin::secp256k1::Secp256k1;
+        use miniscript::descriptor::{Descriptor, DescriptorPublicKey, DescriptorTrait};
 
-        let parsed = Descriptor::<DescriptorPublicKey>::parse_descriptor(&$descriptors.1.expect("Missing internal descriptor")).expect("Failed to parse descriptor in `testutils!(@internal)`").0;
-        parsed.derive(bitcoin::util::bip32::ChildNumber::from_normal_idx($child).unwrap()).address(bitcoin::Network::Regtest).expect("No address form")
+        use $crate::TranslateDescriptor;
+
+        let secp = Secp256k1::new();
+
+        let parsed = Descriptor::<DescriptorPublicKey>::parse_descriptor(&secp, &$descriptors.1.expect("Missing internal descriptor")).expect("Failed to parse descriptor in `testutils!(@internal)`").0;
+        parsed.derive_translated(&secp, $child).address(bitcoin::Network::Regtest).expect("No address form")
     });
     ( @e $descriptors:expr, $child:expr ) => ({ testutils!(@external $descriptors, $child) });
     ( @i $descriptors:expr, $child:expr ) => ({ testutils!(@internal $descriptors, $child) });
@@ -202,6 +245,7 @@ macro_rules! testutils {
         use std::convert::TryInto;
 
         use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
+        use miniscript::TranslatePk;
 
         let mut keys: HashMap<&'static str, (String, Option<String>, Option<String>)> = HashMap::new();
         $(
@@ -209,40 +253,39 @@ macro_rules! testutils {
         )*
 
         let external: Descriptor<String> = FromStr::from_str($external_descriptor).unwrap();
-        let external: Descriptor<String> = external.translate_pk::<_, _, _, &'static str>(|k| {
+        let external: Descriptor<String> = external.translate_pk_infallible::<_, _>(|k| {
             if let Some((key, ext_path, _)) = keys.get(&k.as_str()) {
-                Ok(format!("{}{}", key, ext_path.as_ref().unwrap_or(&"".into())))
+                format!("{}{}", key, ext_path.as_ref().unwrap_or(&"".into()))
             } else {
-                Ok(k.clone())
+                k.clone()
             }
         }, |kh| {
             if let Some((key, ext_path, _)) = keys.get(&kh.as_str()) {
-                Ok(format!("{}{}", key, ext_path.as_ref().unwrap_or(&"".into())))
+                format!("{}{}", key, ext_path.as_ref().unwrap_or(&"".into()))
             } else {
-                Ok(kh.clone())
+                kh.clone()
             }
 
-        }).unwrap();
+        });
         let external = external.to_string();
 
         let mut internal = None::<String>;
         $(
             let string_internal: Descriptor<String> = FromStr::from_str($internal_descriptor).unwrap();
 
-            let string_internal: Descriptor<String> = string_internal.translate_pk::<_, _, _, &'static str>(|k| {
+            let string_internal: Descriptor<String> = string_internal.translate_pk_infallible::<_, _>(|k| {
                 if let Some((key, _, int_path)) = keys.get(&k.as_str()) {
-                    Ok(format!("{}{}", key, int_path.as_ref().unwrap_or(&"".into())))
+                    format!("{}{}", key, int_path.as_ref().unwrap_or(&"".into()))
                 } else {
-                    Ok(k.clone())
+                    k.clone()
                 }
             }, |kh| {
                 if let Some((key, _, int_path)) = keys.get(&kh.as_str()) {
-                    Ok(format!("{}{}", key, int_path.as_ref().unwrap_or(&"".into())))
+                    format!("{}{}", key, int_path.as_ref().unwrap_or(&"".into()))
                 } else {
-                    Ok(kh.clone())
+                    kh.clone()
                 }
-
-            }).unwrap();
+            });
             internal = Some(string_internal.to_string());
         )*
 
@@ -268,9 +311,11 @@ where
 
 impl TestClient {
     pub fn new() -> Self {
-        let url = env::var("MAGICAL_RPC_URL").unwrap_or("127.0.0.1:18443".to_string());
-        let client = RpcClient::new(format!("http://{}", url), get_auth()).unwrap();
-        let electrum = ElectrumClient::new(&get_electrum_url(), None).unwrap();
+        let url = env::var("BDK_RPC_URL").unwrap_or("127.0.0.1:18443".to_string());
+        let wallet = env::var("BDK_RPC_WALLET").unwrap_or("bdk-test".to_string());
+        let client =
+            RpcClient::new(format!("http://{}/wallet/{}", url, wallet), get_auth()).unwrap();
+        let electrum = ElectrumClient::new(&get_electrum_url()).unwrap();
 
         TestClient { client, electrum }
     }
@@ -317,7 +362,7 @@ impl TestClient {
         }
 
         if self.get_balance(None, None).unwrap() < Amount::from_sat(required_balance) {
-            panic!("Insufficient funds in bitcoind. Plase generate a few blocks with: `bitcoin-cli generatetoaddress 10 {}`", self.get_new_address(None, None).unwrap());
+            panic!("Insufficient funds in bitcoind. Please generate a few blocks with: `bitcoin-cli generatetoaddress 10 {}`", self.get_new_address(None, None).unwrap());
         }
 
         // FIXME: core can't create a tx with two outputs to the same address

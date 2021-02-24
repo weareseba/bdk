@@ -79,29 +79,9 @@ pub enum Capability {
     AccurateFees,
 }
 
-/// Marker trait for a blockchain backend
-///
-/// This is a marker trait for blockchain types. It is automatically implemented for types that
-/// implement [`Blockchain`], so as a user of the library you won't have to implement this
-/// manually.
-///
-/// Users of the library will probably never have to implement this trait manually, but they
-/// could still need to import it to define types and structs with generics;
-/// Implementing only the marker trait is pointless, since [`OfflineBlockchain`]
-/// already does that, and whenever [`Blockchain`] is implemented, the marker trait is also
-/// automatically implemented by the library.
-pub trait BlockchainMarker {}
-
-/// The [`BlockchainMarker`] marker trait is automatically implemented for [`Blockchain`] types
-impl<T: Blockchain> BlockchainMarker for T {}
-
-/// Type that only implements [`Blockchain`] and is always "offline"
-pub struct OfflineBlockchain;
-impl BlockchainMarker for OfflineBlockchain {}
-
 /// Trait that defines the actions that must be supported by a blockchain backend
 #[maybe_async]
-pub trait Blockchain: BlockchainMarker {
+pub trait Blockchain {
     /// Return the set of [`Capability`] supported by this backend
     fn get_capabilities(&self) -> HashSet<Capability>;
 
@@ -189,7 +169,7 @@ pub fn progress() -> (Sender<ProgressData>, Receiver<ProgressData>) {
 
 impl Progress for Sender<ProgressData> {
     fn update(&self, progress: f32, message: Option<String>) -> Result<(), Error> {
-        if progress < 0.0 || progress > 100.0 {
+        if !(0.0..=100.0).contains(&progress) {
             return Err(Error::InvalidProgressValue(progress));
         }
 

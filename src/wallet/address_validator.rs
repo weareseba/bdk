@@ -45,12 +45,13 @@
 //! # use bdk::address_validator::*;
 //! # use bdk::database::*;
 //! # use bdk::*;
+//! #[derive(Debug)]
 //! struct PrintAddressAndContinue;
 //!
 //! impl AddressValidator for PrintAddressAndContinue {
 //!     fn validate(
 //!         &self,
-//!         script_type: ScriptType,
+//!         keychain: KeychainKind,
 //!         hd_keypaths: &HDKeyPaths,
 //!         script: &Script
 //!     ) -> Result<(), AddressValidatorError> {
@@ -58,7 +59,7 @@
 //!             .as_ref()
 //!             .map(Address::to_string)
 //!             .unwrap_or(script.to_string());
-//!         println!("New address of type {:?}: {}", script_type, address);
+//!         println!("New address of type {:?}: {}", keychain, address);
 //!         println!("HD keypaths: {:#?}", hd_keypaths);
 //!
 //!         Ok(())
@@ -66,7 +67,7 @@
 //! }
 //!
 //! let descriptor = "wpkh(tpubD6NzVbkrYhZ4Xferm7Pz4VnjdcDPFyjVu5K4iZXQ4pVN8Cks4pHVowTBXBKRhX64pkRyJZJN5xAKj4UDNnLPb5p2sSKXhewoYx5GbTdUFWq/*)";
-//! let mut wallet: OfflineWallet<_> = Wallet::new_offline(descriptor, None, Network::Testnet, MemoryDatabase::default())?;
+//! let mut wallet = Wallet::new_offline(descriptor, None, Network::Testnet, MemoryDatabase::default())?;
 //! wallet.add_address_validator(Arc::new(PrintAddressAndContinue));
 //!
 //! let address = wallet.get_new_address()?;
@@ -79,15 +80,20 @@ use std::fmt;
 use bitcoin::Script;
 
 use crate::descriptor::HDKeyPaths;
-use crate::types::ScriptType;
+use crate::types::KeychainKind;
 
 /// Errors that can be returned to fail the validation of an address
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressValidatorError {
+    /// User rejected the address
     UserRejected,
+    /// Network connection error
     ConnectionError,
+    /// Network request timeout error
     TimeoutError,
+    /// Invalid script
     InvalidScript,
+    /// A custom error message
     Message(String),
 }
 
@@ -106,11 +112,11 @@ impl std::error::Error for AddressValidatorError {}
 /// validator will be propagated up to the original caller that triggered the address generation.
 ///
 /// For a usage example see [this module](crate::address_validator)'s documentation.
-pub trait AddressValidator: Send + Sync {
+pub trait AddressValidator: Send + Sync + fmt::Debug {
     /// Validate or inspect an address
     fn validate(
         &self,
-        script_type: ScriptType,
+        keychain: KeychainKind,
         hd_keypaths: &HDKeyPaths,
         script: &Script,
     ) -> Result<(), AddressValidatorError>;
@@ -122,13 +128,13 @@ mod test {
 
     use super::*;
     use crate::wallet::test::{get_funded_wallet, get_test_wpkh};
-    use crate::wallet::TxBuilder;
 
+    #[derive(Debug)]
     struct TestValidator;
     impl AddressValidator for TestValidator {
         fn validate(
             &self,
-            _script_type: ScriptType,
+            _keychain: KeychainKind,
             _hd_keypaths: &HDKeyPaths,
             _script: &bitcoin::Script,
         ) -> Result<(), AddressValidatorError> {
@@ -152,11 +158,8 @@ mod test {
         wallet.add_address_validator(Arc::new(TestValidator));
 
         let addr = testutils!(@external descriptors, 10);
-        wallet
-            .create_tx(TxBuilder::with_recipients(vec![(
-                addr.script_pubkey(),
-                25_000,
-            )]))
-            .unwrap();
+        let mut builder = wallet.build_tx();
+        builder.add_recipient(addr.script_pubkey(), 25_000);
+        builder.finish().unwrap();
     }
 }

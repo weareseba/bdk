@@ -36,11 +36,11 @@ use bitcoin::{
     },
 };
 use bitcoin_hashes::{hash160, sha256d, Hash};
+use bitcoinconsensus;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
 
-use crate::blockchain::BlockchainMarker;
 use crate::database::BatchDatabase;
 use crate::error::Error;
 use crate::wallet::Wallet;
@@ -59,7 +59,9 @@ pub trait ProofOfReserves {
         self.do_verify_proof(psbt, message)
     }
 
+    /// implementation
     fn do_create_proof(&self, message: &str) -> Result<PSBT, Error>;
+    /// implementation
     fn do_verify_proof(&self, psbt: &PSBT, message: &str) -> Result<u64, Error>;
     // ToDo: how can we remove this helper function from the trait definition, but keep in the implementation?
     fn get_spendable_value_from_input(&self, pinp: &psbt::Input) -> Result<u64, Error>;
@@ -67,7 +69,7 @@ pub trait ProofOfReserves {
 
 impl<B, D> ProofOfReserves for Wallet<B, D>
 where
-    B: BlockchainMarker,
+    //    B: BlockchainMarker,
     D: BatchDatabase,
 {
     fn do_create_proof(&self, message: &str) -> Result<PSBT, Error> {
@@ -78,7 +80,7 @@ where
                 script_pubkey: Builder::new().push_opcode(opcodes::OP_TRUE).into_script(),
             }),
             witness_script: Some(Builder::new().into_script()),
-            final_script_sig: Some(Builder::new().into_script()),
+            final_script_sig: None,
             ..Default::default()
         };
 
@@ -98,12 +100,9 @@ where
             };
             let proof_psbt_inp = Input {
                 // ToDo: unsure about the next few lines
-                witness_utxo: Some(TxOut {
-                    value: utxo.txout.value,
-                    script_pubkey: Builder::new().push_opcode(opcodes::OP_TRUE).into_script(),
-                }),
-                witness_script: Some(Builder::new().into_script()),
-                final_script_sig: Some(Builder::new().into_script()),
+                witness_utxo: None,
+                witness_script: None,
+                final_script_sig: None,
                 ..Default::default()
             };
             tx_inputs.push(proof_txin);
@@ -128,8 +127,14 @@ where
                 script_pubkey: out_script_unspendable,
             }],
         };
-        let mut psbt =
-            PSBT::from_unsigned_tx(tx).expect("error constructing PSBT from unsigned tx");
+        let mut psbt = match PSBT::from_unsigned_tx(tx) {
+            Ok(psbt) => psbt,
+            Err(_err) => {
+                return Err(Error::Generic(
+                    "error constructing PSBT from unsigned tx".to_string(),
+                ))
+            }
+        };
         psbt.inputs = psbt_inputs;
         // We can leave the one psbt output empty.
 
@@ -257,30 +262,30 @@ mod test {
     use std::{
         fs::{self, File},
         io::Write,
+        str::FromStr,
     };
 
     use super::*;
     use crate::blockchain::{noop_progress, ElectrumBlockchain};
     use crate::database::memory::MemoryDatabase;
     use crate::electrum_client::Client;
-    use crate::wallet::OfflineWallet;
+    use crate::types::{KeychainKind, TransactionDetails, UTXO};
 
     pub(crate) fn get_funded_wallet(
         descriptor: &str,
         network: Network,
     ) -> (
-        OfflineWallet<MemoryDatabase>,
+        Wallet<(), MemoryDatabase>,
         (String, Option<String>),
         bitcoin::Txid,
     ) {
         let descriptors = testutils!(@descriptors (descriptor));
-        let wallet: OfflineWallet<_> =
+        let wallet =
             Wallet::new_offline(&descriptors.0, None, network, MemoryDatabase::new()).unwrap();
 
-        let txid = wallet.database.borrow_mut().received_tx(
-            testutils! {
-                @tx ( (@external descriptors, 0) => 50_000 ) (@confirmations 1)
-            },
+        let txid = crate::populate_test_db!(
+            wallet.database.borrow_mut(),
+            testutils! (@tx ( (@external descriptors, 0) => 50_000 ) (@confirmations 1)),
             Some(100),
         );
 
@@ -354,7 +359,7 @@ mod test {
             desc
         }) + &postfix;
 
-        let client = Client::new("ssl://electrum.blockstream.info:60002", None)?;
+        let client = Client::new("ssl://electrum.blockstream.info:60002")?;
         let wallet = Wallet::new(
             &desc,
             None,

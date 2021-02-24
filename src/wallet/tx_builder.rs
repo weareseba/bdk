@@ -32,14 +32,21 @@
 //! # use bdk::*;
 //! # use bdk::wallet::tx_builder::CreateTx;
 //! # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap();
-//! // Create a transaction with one output to `to_address` of 50_000 satoshi, with a custom fee rate
-//! // of 5.0 satoshi/vbyte, only spending non-change outputs and with RBF signaling
-//! // enabled
-//! let builder = TxBuilder::with_recipients(vec![(to_address.script_pubkey(), 50_000)])
+//! # let wallet = doctest_wallet!();
+//! // create a TxBuilder from a wallet
+//! let mut tx_builder = wallet.build_tx();
+//!
+//! tx_builder
+//!     // Create a transaction with one output to `to_address` of 50_000 satoshi
+//!     .add_recipient(to_address.script_pubkey(), 50_000)
+//!     // With a custom fee rate of 5.0 satoshi/vbyte
 //!     .fee_rate(FeeRate::from_sat_per_vb(5.0))
+//!     // Only spend non-change outputs
 //!     .do_not_spend_change()
+//!     // Turn on RBF signaling
 //!     .enable_rbf();
-//! # let builder: TxBuilder<bdk::database::MemoryDatabase, _, CreateTx> = builder;
+//! let (psbt, tx_details) = tx_builder.finish()?;
+//! # Ok::<(), bdk::Error>(())
 //! ```
 
 use std::collections::BTreeMap;
@@ -47,55 +54,124 @@ use std::collections::HashSet;
 use std::default::Default;
 use std::marker::PhantomData;
 
+use bitcoin::util::psbt::PartiallySignedTransaction as PSBT;
 use bitcoin::{OutPoint, Script, SigHashType, Transaction};
 
-use super::coin_selection::{CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm};
-use crate::database::Database;
-use crate::types::{FeeRate, ScriptType, UTXO};
+use miniscript::descriptor::DescriptorTrait;
 
+use super::coin_selection::{CoinSelectionAlgorithm, DefaultCoinSelectionAlgorithm};
+use crate::{database::BatchDatabase, Error, Wallet};
+use crate::{
+    types::{FeeRate, KeychainKind, UTXO},
+    TransactionDetails,
+};
 /// Context in which the [`TxBuilder`] is valid
 pub trait TxBuilderContext: std::fmt::Debug + Default + Clone {}
 
-/// [`Wallet::create_tx`](super::Wallet::create_tx) context
+/// Marker type to indicate the [`TxBuilder`] is being used to create a new transaction (as opposed
+/// to bumping the fee of an existing one).
 #[derive(Debug, Default, Clone)]
 pub struct CreateTx;
 impl TxBuilderContext for CreateTx {}
 
-/// [`Wallet::bump_fee`](super::Wallet::bump_fee) context
+/// Marker type to indicate the [`TxBuilder`] is being used to bump the fee of an existing transaction.
 #[derive(Debug, Default, Clone)]
 pub struct BumpFee;
 impl TxBuilderContext for BumpFee {}
 
 /// A transaction builder
 ///
-/// This structure contains the configuration that the wallet must follow to build a transaction.
+/// A `TxBuilder` is created by calling [`build_tx`] or [`build_fee_bump`] on a wallet. After
+/// assigning it, you set options on it until finally calling [`finish`] to consume the builder and
+/// generate the transaction.
 ///
-/// For an example see [this module](super::tx_builder)'s documentation;
-#[derive(Debug)]
-pub struct TxBuilder<D: Database, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext> {
+/// Each option setting method on `TxBuilder` takes and returns `&mut self` so you can chain calls
+/// as in the following example:
+///
+/// ```
+/// # use bdk::*;
+/// # use bdk::wallet::tx_builder::*;
+/// # use bitcoin::*;
+/// # use core::str::FromStr;
+/// # let wallet = doctest_wallet!();
+/// # let addr1 = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap();
+/// # let addr2 = addr1.clone();
+/// // chaining
+/// let (psbt1, details) = {
+///     let mut builder = wallet.build_tx();
+///     builder
+///        .ordering(TxOrdering::Untouched)
+///        .add_recipient(addr1.script_pubkey(), 50_000)
+///        .add_recipient(addr2.script_pubkey(), 50_000);
+///     builder.finish()?
+/// };
+///
+/// // non-chaining
+/// let (psbt2, details) = {
+///     let mut builder = wallet.build_tx();
+///     builder.ordering(TxOrdering::Untouched);
+///     for addr in &[addr1, addr2] {
+///         builder.add_recipient(addr.script_pubkey(), 50_000);
+///     }
+///     builder.finish()?
+/// };
+///
+/// assert_eq!(psbt1.global.unsigned_tx.output[..2], psbt2.global.unsigned_tx.output[..2]);
+/// # Ok::<(), bdk::Error>(())
+/// ```
+///
+/// At the moment [`coin_selection`] is an exception to the rule as it consumes `self`.
+/// This means it is usually best to call [`coin_selection`] on the return value of `build_tx` before assigning it.
+///
+/// For further examples see [this module](super::tx_builder)'s documentation;
+///
+/// [`build_tx`]: Wallet::build_tx
+/// [`build_fee_bump`]: Wallet::build_fee_bump
+/// [`finish`]: Self::finish
+/// [`coin_selection`]: Self::coin_selection
+#[derive(Clone, Debug)]
+pub struct TxBuilder<'a, B, D, Cs, Ctx> {
+    pub(crate) wallet: &'a Wallet<B, D>,
+    // params and coin_selection are Options not becasue they are optionally set (they are always
+    // there) but because `.finish()` uses `Option::take` to get an owned value from a &mut self.
+    // They are only `None` after `.finish()` is called.
+    pub(crate) params: TxParams,
+    pub(crate) coin_selection: Cs,
+    pub(crate) phantom: PhantomData<Ctx>,
+}
+
+/// The parameters for transaction creation sans coin selection algorithm.
+//TODO: TxParams should eventually be exposed publicly.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct TxParams {
     pub(crate) recipients: Vec<(Script, u64)>,
     pub(crate) drain_wallet: bool,
     pub(crate) single_recipient: Option<Script>,
     pub(crate) fee_policy: Option<FeePolicy>,
     pub(crate) internal_policy_path: Option<BTreeMap<String, Vec<usize>>>,
     pub(crate) external_policy_path: Option<BTreeMap<String, Vec<usize>>>,
-    pub(crate) utxos: Vec<OutPoint>,
+    pub(crate) utxos: Vec<(UTXO, usize)>,
     pub(crate) unspendable: HashSet<OutPoint>,
     pub(crate) manually_selected_only: bool,
     pub(crate) sighash: Option<SigHashType>,
     pub(crate) ordering: TxOrdering,
     pub(crate) locktime: Option<u32>,
-    pub(crate) rbf: Option<u32>,
+    pub(crate) rbf: Option<RBFValue>,
     pub(crate) version: Option<Version>,
     pub(crate) change_policy: ChangeSpendPolicy,
     pub(crate) force_non_witness_utxo: bool,
-    pub(crate) coin_selection: Cs,
+    pub(crate) add_global_xpubs: bool,
     pub(crate) include_output_redeem_witness_script: bool,
-
-    phantom: PhantomData<(D, Ctx)>,
+    pub(crate) bumping_fee: Option<PreviousFee>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreviousFee {
+    pub absolute: u64,
+    pub rate: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum FeePolicy {
     FeeRate(FeeRate),
     FeeAmount(u64),
@@ -107,61 +183,23 @@ impl std::default::Default for FeePolicy {
     }
 }
 
-// Unfortunately derive doesn't work with `PhantomData`: https://github.com/rust-lang/rust/issues/26925
-impl<D: Database, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext> Default
-    for TxBuilder<D, Cs, Ctx>
-where
-    Cs: Default,
-{
-    fn default() -> Self {
-        TxBuilder {
-            recipients: Default::default(),
-            drain_wallet: Default::default(),
-            single_recipient: Default::default(),
-            fee_policy: Default::default(),
-            internal_policy_path: Default::default(),
-            external_policy_path: Default::default(),
-            utxos: Default::default(),
-            unspendable: Default::default(),
-            manually_selected_only: Default::default(),
-            sighash: Default::default(),
-            ordering: Default::default(),
-            locktime: Default::default(),
-            rbf: Default::default(),
-            version: Default::default(),
-            change_policy: Default::default(),
-            force_non_witness_utxo: Default::default(),
-            coin_selection: Default::default(),
-            include_output_redeem_witness_script: Default::default(),
-
-            phantom: PhantomData,
-        }
-    }
-}
-
-// methods supported by both contexts, but only for `DefaultCoinSelectionAlgorithm`
-impl<D: Database, Ctx: TxBuilderContext> TxBuilder<D, DefaultCoinSelectionAlgorithm, Ctx> {
-    /// Create an empty builder
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 // methods supported by both contexts, for any CoinSelectionAlgorithm
-impl<D: Database, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext> TxBuilder<D, Cs, Ctx> {
+impl<'a, B, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext>
+    TxBuilder<'a, B, D, Cs, Ctx>
+{
     /// Set a custom fee rate
-    pub fn fee_rate(mut self, fee_rate: FeeRate) -> Self {
-        self.fee_policy = Some(FeePolicy::FeeRate(fee_rate));
+    pub fn fee_rate(&mut self, fee_rate: FeeRate) -> &mut Self {
+        self.params.fee_policy = Some(FeePolicy::FeeRate(fee_rate));
         self
     }
 
     /// Set an absolute fee
-    pub fn fee_absolute(mut self, fee_amount: u64) -> Self {
-        self.fee_policy = Some(FeePolicy::FeeAmount(fee_amount));
+    pub fn fee_absolute(&mut self, fee_amount: u64) -> &mut Self {
+        self.params.fee_policy = Some(FeePolicy::FeeAmount(fee_amount));
         self
     }
 
-    /// Set the policy path to use while creating the transaction for a given script type
+    /// Set the policy path to use while creating the transaction for a given keychain.
     ///
     /// This method accepts a map where the key is the policy node id (see
     /// [`Policy::id`](crate::descriptor::Policy::id)) and the value is the list of the indexes of
@@ -209,96 +247,107 @@ impl<D: Database, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext> TxBuilde
     /// # use bitcoin::*;
     /// # use bdk::*;
     /// # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap();
+    /// # let wallet = doctest_wallet!();
     /// let mut path = BTreeMap::new();
     /// path.insert("aabbccdd".to_string(), vec![0, 1]);
     ///
-    /// let builder = TxBuilder::with_recipients(vec![(to_address.script_pubkey(), 50_000)])
-    ///     .policy_path(path, ScriptType::External);
-    /// # let builder: TxBuilder<bdk::database::MemoryDatabase, _, _> = builder;
+    /// let builder = wallet.build_tx()
+    ///     .add_recipient(to_address.script_pubkey(), 50_000)
+    ///     .policy_path(path, KeychainKind::External);
+    ///
+    /// # Ok::<(), bdk::Error>(())
     /// ```
     pub fn policy_path(
-        mut self,
+        &mut self,
         policy_path: BTreeMap<String, Vec<usize>>,
-        script_type: ScriptType,
-    ) -> Self {
-        let to_update = match script_type {
-            ScriptType::Internal => &mut self.internal_policy_path,
-            ScriptType::External => &mut self.external_policy_path,
+        keychain: KeychainKind,
+    ) -> &mut Self {
+        let to_update = match keychain {
+            KeychainKind::Internal => &mut self.params.internal_policy_path,
+            KeychainKind::External => &mut self.params.external_policy_path,
         };
 
         *to_update = Some(policy_path);
         self
     }
 
-    /// Replace the internal list of utxos that **must** be spent with a new list
+    /// Add the list of outpoints to the internal list of UTXOs that **must** be spent.
+    ///
+    /// If an error occurs while adding any of the UTXOs then none of them are added and the error is returned.
     ///
     /// These have priority over the "unspendable" utxos, meaning that if a utxo is present both in
     /// the "utxos" and the "unspendable" list, it will be spent.
-    pub fn utxos(mut self, utxos: Vec<OutPoint>) -> Self {
-        self.utxos = utxos;
-        self
+    pub fn add_utxos(&mut self, outpoints: &[OutPoint]) -> Result<&mut Self, Error> {
+        let utxos = outpoints
+            .iter()
+            .map(|outpoint| self.wallet.get_utxo(*outpoint)?.ok_or(Error::UnknownUTXO))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for utxo in utxos {
+            let descriptor = self.wallet.get_descriptor_for_keychain(utxo.keychain);
+            let satisfaction_weight = descriptor.max_satisfaction_weight().unwrap();
+            self.params.utxos.push((utxo, satisfaction_weight));
+        }
+
+        Ok(self)
     }
 
     /// Add a utxo to the internal list of utxos that **must** be spent
     ///
     /// These have priority over the "unspendable" utxos, meaning that if a utxo is present both in
     /// the "utxos" and the "unspendable" list, it will be spent.
-    pub fn add_utxo(mut self, utxo: OutPoint) -> Self {
-        self.utxos.push(utxo);
-        self
+    pub fn add_utxo(&mut self, outpoint: OutPoint) -> Result<&mut Self, Error> {
+        self.add_utxos(&[outpoint])
     }
 
-    /// Only spend utxos added by [`add_utxo`] and [`utxos`].
+    /// Only spend utxos added by [`add_utxo`].
     ///
     /// The wallet will **not** add additional utxos to the transaction even if they are needed to
     /// make the transaction valid.
     ///
     /// [`add_utxo`]: Self::add_utxo
-    /// [`utxos`]: Self::utxos
-    pub fn manually_selected_only(mut self) -> Self {
-        self.manually_selected_only = true;
+    pub fn manually_selected_only(&mut self) -> &mut Self {
+        self.params.manually_selected_only = true;
         self
     }
 
     /// Replace the internal list of unspendable utxos with a new list
     ///
-    /// It's important to note that the "must-be-spent" utxos added with [`TxBuilder::utxos`] and
-    /// [`TxBuilder::add_utxo`] have priority over these. See the docs of the two linked methods
-    /// for more details.
-    pub fn unspendable(mut self, unspendable: Vec<OutPoint>) -> Self {
-        self.unspendable = unspendable.into_iter().collect();
+    /// It's important to note that the "must-be-spent" utxos added with [`TxBuilder::add_utxo`]
+    /// have priority over these. See the docs of the two linked methods for more details.
+    pub fn unspendable(&mut self, unspendable: Vec<OutPoint>) -> &mut Self {
+        self.params.unspendable = unspendable.into_iter().collect();
         self
     }
 
     /// Add a utxo to the internal list of unspendable utxos
     ///
-    /// It's important to note that the "must-be-spent" utxos added with [`TxBuilder::utxos`] and
-    /// [`TxBuilder::add_utxo`] have priority over this. See the docs of the two linked methods
-    /// for more details.
-    pub fn add_unspendable(mut self, unspendable: OutPoint) -> Self {
-        self.unspendable.insert(unspendable);
+    /// It's important to note that the "must-be-spent" utxos added with [`TxBuilder::add_utxo`]
+    /// have priority over this. See the docs of the two linked methods for more details.
+    pub fn add_unspendable(&mut self, unspendable: OutPoint) -> &mut Self {
+        self.params.unspendable.insert(unspendable);
         self
     }
 
     /// Sign with a specific sig hash
     ///
     /// **Use this option very carefully**
-    pub fn sighash(mut self, sighash: SigHashType) -> Self {
-        self.sighash = Some(sighash);
+    pub fn sighash(&mut self, sighash: SigHashType) -> &mut Self {
+        self.params.sighash = Some(sighash);
         self
     }
 
     /// Choose the ordering for inputs and outputs of the transaction
-    pub fn ordering(mut self, ordering: TxOrdering) -> Self {
-        self.ordering = ordering;
+    pub fn ordering(&mut self, ordering: TxOrdering) -> &mut Self {
+        self.params.ordering = ordering;
         self
     }
 
     /// Use a specific nLockTime while creating the transaction
     ///
     /// This can cause conflicts if the wallet's descriptors contain an "after" (OP_CLTV) operator.
-    pub fn nlocktime(mut self, locktime: u32) -> Self {
-        self.locktime = Some(locktime);
+    pub fn nlocktime(&mut self, locktime: u32) -> &mut Self {
+        self.params.locktime = Some(locktime);
         self
     }
 
@@ -306,8 +355,8 @@ impl<D: Database, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext> TxBuilde
     ///
     /// The `version` should always be greater than `0` and greater than `1` if the wallet's
     /// descriptors contain an "older" (OP_CSV) operator.
-    pub fn version(mut self, version: i32) -> Self {
-        self.version = Some(Version(version));
+    pub fn version(&mut self, version: i32) -> &mut Self {
+        self.params.version = Some(Version(version));
         self
     }
 
@@ -315,8 +364,8 @@ impl<D: Database, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext> TxBuilde
     ///
     /// This effectively adds all the change outputs to the "unspendable" list. See
     /// [`TxBuilder::unspendable`].
-    pub fn do_not_spend_change(mut self) -> Self {
-        self.change_policy = ChangeSpendPolicy::ChangeForbidden;
+    pub fn do_not_spend_change(&mut self) -> &mut Self {
+        self.params.change_policy = ChangeSpendPolicy::ChangeForbidden;
         self
     }
 
@@ -324,15 +373,15 @@ impl<D: Database, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext> TxBuilde
     ///
     /// This effectively adds all the non-change outputs to the "unspendable" list. See
     /// [`TxBuilder::unspendable`].
-    pub fn only_spend_change(mut self) -> Self {
-        self.change_policy = ChangeSpendPolicy::OnlyChange;
+    pub fn only_spend_change(&mut self) -> &mut Self {
+        self.params.change_policy = ChangeSpendPolicy::OnlyChange;
         self
     }
 
     /// Set a specific [`ChangeSpendPolicy`]. See [`TxBuilder::do_not_spend_change`] and
     /// [`TxBuilder::only_spend_change`] for some shortcuts.
-    pub fn change_policy(mut self, change_policy: ChangeSpendPolicy) -> Self {
-        self.change_policy = change_policy;
+    pub fn change_policy(&mut self, change_policy: ChangeSpendPolicy) -> &mut Self {
+        self.params.change_policy = change_policy;
         self
     }
 
@@ -340,77 +389,73 @@ impl<D: Database, Cs: CoinSelectionAlgorithm<D>, Ctx: TxBuilderContext> TxBuilde
     /// descriptors.
     ///
     /// This is useful for signers which always require it, like Trezor hardware wallets.
-    pub fn force_non_witness_utxo(mut self) -> Self {
-        self.force_non_witness_utxo = true;
+    pub fn force_non_witness_utxo(&mut self) -> &mut Self {
+        self.params.force_non_witness_utxo = true;
         self
-    }
-
-    /// Spend all the available inputs. This respects filters like [`unspendable`] and the change policy.
-    pub fn drain_wallet(mut self) -> Self {
-        self.drain_wallet = true;
-        self
-    }
-
-    /// Choose the coin selection algorithm
-    ///
-    /// Overrides the [`DefaultCoinSelectionAlgorithm`](super::coin_selection::DefaultCoinSelectionAlgorithm).
-    pub fn coin_selection<P: CoinSelectionAlgorithm<D>>(
-        self,
-        coin_selection: P,
-    ) -> TxBuilder<D, P, Ctx> {
-        TxBuilder {
-            recipients: self.recipients,
-            drain_wallet: self.drain_wallet,
-            single_recipient: self.single_recipient,
-            fee_policy: self.fee_policy,
-            internal_policy_path: self.internal_policy_path,
-            external_policy_path: self.external_policy_path,
-            utxos: self.utxos,
-            unspendable: self.unspendable,
-            manually_selected_only: self.manually_selected_only,
-            sighash: self.sighash,
-            ordering: self.ordering,
-            locktime: self.locktime,
-            rbf: self.rbf,
-            version: self.version,
-            change_policy: self.change_policy,
-            force_non_witness_utxo: self.force_non_witness_utxo,
-            coin_selection,
-            include_output_redeem_witness_script: self.include_output_redeem_witness_script,
-
-            phantom: PhantomData,
-        }
     }
 
     /// Fill-in the [`psbt::Output::redeem_script`](bitcoin::util::psbt::Output::redeem_script) and
     /// [`psbt::Output::witness_script`](bitcoin::util::psbt::Output::witness_script) fields.
     ///
     /// This is useful for signers which always require it, like ColdCard hardware wallets.
-    pub fn include_output_redeem_witness_script(mut self) -> Self {
-        self.include_output_redeem_witness_script = true;
+    pub fn include_output_redeem_witness_script(&mut self) -> &mut Self {
+        self.params.include_output_redeem_witness_script = true;
         self
     }
-}
 
-// methods supported only by create_tx, and only for `DefaultCoinSelectionAlgorithm`
-impl<D: Database> TxBuilder<D, DefaultCoinSelectionAlgorithm, CreateTx> {
-    /// Create a builder starting from a list of recipients
-    pub fn with_recipients(recipients: Vec<(Script, u64)>) -> Self {
-        Self::default().set_recipients(recipients)
+    /// Fill-in the `PSBT_GLOBAL_XPUB` field with the extended keys contained in both the external
+    /// and internal descriptors
+    ///
+    /// This is useful for offline signers that take part to a multisig. Some hardware wallets like
+    /// BitBox and ColdCard are known to require this.
+    pub fn add_global_xpubs(&mut self) -> &mut Self {
+        self.params.add_global_xpubs = true;
+        self
+    }
+
+    /// Spend all the available inputs. This respects filters like [`TxBuilder::unspendable`] and the change policy.
+    pub fn drain_wallet(&mut self) -> &mut Self {
+        self.params.drain_wallet = true;
+        self
+    }
+
+    /// Choose the coin selection algorithm
+    ///
+    /// Overrides the [`DefaultCoinSelectionAlgorithm`](super::coin_selection::DefaultCoinSelectionAlgorithm).
+    ///
+    /// Note that this function consumes the builder and returns it so it is usually best to put this as the first call on the builder.
+    pub fn coin_selection<P: CoinSelectionAlgorithm<D>>(
+        self,
+        coin_selection: P,
+    ) -> TxBuilder<'a, B, D, P, Ctx> {
+        TxBuilder {
+            wallet: self.wallet,
+            params: self.params,
+            coin_selection,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Finish the building the transaction.
+    ///
+    /// Returns the [`BIP174`] "PSBT" and summary details about the transaction.
+    ///
+    /// [`BIP174`]: https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
+    pub fn finish(self) -> Result<(PSBT, TransactionDetails), Error> {
+        self.wallet.create_tx(self.coin_selection, self.params)
     }
 }
 
-// methods supported only by create_tx, for any `CoinSelectionAlgorithm`
-impl<D: Database, Cs: CoinSelectionAlgorithm<D>> TxBuilder<D, Cs, CreateTx> {
+impl<'a, B, D: BatchDatabase, Cs: CoinSelectionAlgorithm<D>> TxBuilder<'a, B, D, Cs, CreateTx> {
     /// Replace the recipients already added with a new list
-    pub fn set_recipients(mut self, recipients: Vec<(Script, u64)>) -> Self {
-        self.recipients = recipients;
+    pub fn set_recipients(&mut self, recipients: Vec<(Script, u64)>) -> &mut Self {
+        self.params.recipients = recipients;
         self
     }
 
     /// Add a recipient to the internal list
-    pub fn add_recipient(mut self, script_pubkey: Script, amount: u64) -> Self {
-        self.recipients.push((script_pubkey, amount));
+    pub fn add_recipient(&mut self, script_pubkey: Script, amount: u64) -> &mut Self {
+        self.params.recipients.push((script_pubkey, amount));
         self
     }
 
@@ -423,14 +468,14 @@ impl<D: Database, Cs: CoinSelectionAlgorithm<D>> TxBuilder<D, Cs, CreateTx> {
     /// It can only be used in conjunction with [`drain_wallet`](Self::drain_wallet) to send the
     /// entire content of the wallet (minus filters) to a single recipient or with a
     /// list of manually selected UTXOs by enabling [`manually_selected_only`](Self::manually_selected_only)
-    /// and selecting them with [`utxos`](Self::utxos) or [`add_utxo`](Self::add_utxo).
+    /// and selecting them with or [`add_utxo`](Self::add_utxo).
     ///
     /// When bumping the fees of a transaction made with this option, the user should remeber to
     /// add [`maintain_single_recipient`](Self::maintain_single_recipient) to correctly update the
     /// single output instead of adding one more for the change.
-    pub fn set_single_recipient(mut self, recipient: Script) -> Self {
-        self.single_recipient = Some(recipient);
-        self.recipients.clear();
+    pub fn set_single_recipient(&mut self, recipient: Script) -> &mut Self {
+        self.params.single_recipient = Some(recipient);
+        self.params.recipients.clear();
 
         self
     }
@@ -438,8 +483,9 @@ impl<D: Database, Cs: CoinSelectionAlgorithm<D>> TxBuilder<D, Cs, CreateTx> {
     /// Enable signaling RBF
     ///
     /// This will use the default nSequence value of `0xFFFFFFFD`.
-    pub fn enable_rbf(self) -> Self {
-        self.enable_rbf_with_sequence(0xFFFFFFFD)
+    pub fn enable_rbf(&mut self) -> &mut Self {
+        self.params.rbf = Some(RBFValue::Default);
+        self
     }
 
     /// Enable signaling RBF with a specific nSequence value
@@ -449,17 +495,17 @@ impl<D: Database, Cs: CoinSelectionAlgorithm<D>> TxBuilder<D, Cs, CreateTx> {
     ///
     /// If the `nsequence` is higher than `0xFFFFFFFD` an error will be thrown, since it would not
     /// be a valid nSequence to signal RBF.
-    pub fn enable_rbf_with_sequence(mut self, nsequence: u32) -> Self {
-        self.rbf = Some(nsequence);
+    pub fn enable_rbf_with_sequence(&mut self, nsequence: u32) -> &mut Self {
+        self.params.rbf = Some(RBFValue::Value(nsequence));
         self
     }
 }
 
 // methods supported only by bump_fee
-impl<D: Database> TxBuilder<D, DefaultCoinSelectionAlgorithm, BumpFee> {
+impl<'a, B, D: BatchDatabase> TxBuilder<'a, B, D, DefaultCoinSelectionAlgorithm, BumpFee> {
     /// Bump the fees of a transaction made with [`set_single_recipient`](Self::set_single_recipient)
     ///
-    /// Unless extra inputs are specified with [`add_utxo`] or [`utxos`], this flag will make
+    /// Unless extra inputs are specified with [`add_utxo`], this flag will make
     /// `bump_fee` reduce the value of the existing output, or fail if it would be consumed
     /// entirely given the higher new fee rate.
     ///
@@ -469,10 +515,13 @@ impl<D: Database> TxBuilder<D, DefaultCoinSelectionAlgorithm, BumpFee> {
     /// Fails if the transaction has more than one outputs.
     ///
     /// [`add_utxo`]: Self::add_utxo
-    /// [`utxos`]: Self::utxos
-    pub fn maintain_single_recipient(mut self) -> Self {
-        self.single_recipient = Some(Script::default());
-        self
+    pub fn maintain_single_recipient(&mut self) -> Result<&mut Self, Error> {
+        let mut recipients = self.params.recipients.drain(..).collect::<Vec<_>>();
+        if recipients.len() != 1 {
+            return Err(Error::SingleRecipientMultipleOutputs);
+        }
+        self.params.single_recipient = Some(recipients.pop().unwrap().0);
+        Ok(self)
     }
 }
 
@@ -494,6 +543,7 @@ impl Default for TxOrdering {
 }
 
 impl TxOrdering {
+    /// Sort transaction inputs and outputs by [`TxOrdering`] variant
     pub fn sort_tx(&self, tx: &mut Transaction) {
         match self {
             TxOrdering::Untouched => {}
@@ -532,6 +582,24 @@ impl Default for Version {
     }
 }
 
+/// RBF nSequence value
+///
+/// Has a default value of `0xFFFFFFFD`
+#[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
+pub(crate) enum RBFValue {
+    Default,
+    Value(u32),
+}
+
+impl RBFValue {
+    pub(crate) fn get_value(&self) -> u32 {
+        match self {
+            RBFValue::Default => 0xFFFFFFFD,
+            RBFValue::Value(v) => *v,
+        }
+    }
+}
+
 /// Policy regarding the use of change outputs when creating a transaction
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq, Hash, Clone, Copy)]
 pub enum ChangeSpendPolicy {
@@ -553,8 +621,8 @@ impl ChangeSpendPolicy {
     pub(crate) fn is_satisfied_by(&self, utxo: &UTXO) -> bool {
         match self {
             ChangeSpendPolicy::ChangeAllowed => true,
-            ChangeSpendPolicy::OnlyChange => utxo.is_internal,
-            ChangeSpendPolicy::ChangeForbidden => !utxo.is_internal,
+            ChangeSpendPolicy::OnlyChange => utxo.keychain == KeychainKind::Internal,
+            ChangeSpendPolicy::ChangeForbidden => utxo.keychain == KeychainKind::External,
         }
     }
 }
@@ -649,7 +717,7 @@ mod test {
                     vout: 0,
                 },
                 txout: Default::default(),
-                is_internal: false,
+                keychain: KeychainKind::External,
             },
             UTXO {
                 outpoint: OutPoint {
@@ -657,7 +725,7 @@ mod test {
                     vout: 1,
                 },
                 txout: Default::default(),
-                is_internal: true,
+                keychain: KeychainKind::Internal,
             },
         ]
     }
@@ -682,7 +750,7 @@ mod test {
             .collect::<Vec<_>>();
 
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].is_internal, false);
+        assert_eq!(filtered[0].keychain, KeychainKind::External);
     }
 
     #[test]
@@ -694,7 +762,7 @@ mod test {
             .collect::<Vec<_>>();
 
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].is_internal, true);
+        assert_eq!(filtered[0].keychain, KeychainKind::Internal);
     }
 
     #[test]

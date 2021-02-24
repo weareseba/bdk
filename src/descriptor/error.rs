@@ -27,29 +27,30 @@
 /// Errors related to the parsing and usage of descriptors
 #[derive(Debug)]
 pub enum Error {
-    InternalError,
-    InvalidPrefix(Vec<u8>),
-    HardenedDerivationOnXpub,
-    MalformedInput,
+    /// Invalid HD Key path, such as having a wildcard but a length != 1
     InvalidHDKeyPath,
+    /// The provided descriptor doesn't match its checksum
+    InvalidDescriptorChecksum,
+    /// The descriptor contains hardened derivation steps on public extended keys
+    HardenedDerivationXpub,
 
-    KeyParsingError(String),
+    /// Error thrown while working with [`keys`](crate::keys)
     Key(crate::keys::KeyError),
-
+    /// Error while extracting and manipulating policies
     Policy(crate::descriptor::policy::PolicyError),
 
-    InputIndexDoesntExist,
-    MissingPublicKey,
-    MissingDetails,
-
+    /// Invalid character found in the descriptor checksum
     InvalidDescriptorCharacter(char),
 
-    CantDeriveWithMiniscript,
-
+    /// BIP32 error
     BIP32(bitcoin::util::bip32::Error),
+    /// Error during base58 decoding
     Base58(bitcoin::util::base58::Error),
+    /// Key-related error
     PK(bitcoin::util::key::Error),
+    /// Miniscript error
     Miniscript(miniscript::Error),
+    /// Hex decoding error
     Hex(bitcoin::hashes::hex::Error),
 }
 

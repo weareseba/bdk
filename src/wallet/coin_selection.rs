@@ -27,24 +27,22 @@
 //! This module provides the trait [`CoinSelectionAlgorithm`] that can be implemented to
 //! define custom coin selection algorithms.
 //!
-//! The coin selection algorithm is not globally part of a [`Wallet`](super::Wallet), instead it
-//! is selected whenever a [`Wallet::create_tx`](super::Wallet::create_tx) call is made, through
-//! the use of the [`TxBuilder`] structure, specifically with
-//! [`TxBuilder::coin_selection`](super::tx_builder::TxBuilder::coin_selection) method.
-//!
-//! The [`DefaultCoinSelectionAlgorithm`] selects the default coin selection algorithm that
-//! [`TxBuilder`] uses, if it's not explicitly overridden.
+//! You can specify a custom coin selection algorithm through the [`coin_selection`] method on
+//! [`TxBuilder`]. [`DefaultCoinSelectionAlgorithm`] aliases the coin selection algorithm that will
+//! be used if it is not explicitly set.
 //!
 //! [`TxBuilder`]: super::tx_builder::TxBuilder
+//! [`coin_selection`]: super::tx_builder::TxBuilder::coin_selection
 //!
 //! ## Example
 //!
-//! ```no_run
+//! ```
 //! # use std::str::FromStr;
 //! # use bitcoin::*;
 //! # use bdk::wallet::coin_selection::*;
 //! # use bdk::database::Database;
 //! # use bdk::*;
+//! # const TXIN_BASE_WEIGHT: usize = (32 + 4 + 4 + 1) * 4;
 //! #[derive(Debug)]
 //! struct AlwaysSpendEverything;
 //!
@@ -70,9 +68,9 @@
 //!             })
 //!             .collect::<Vec<_>>();
 //!         let additional_fees = additional_weight as f32 * fee_rate.as_sat_vb() / 4.0;
-//!
-//!         if (fee_amount + additional_fees).ceil() as u64 + amount_needed > selected_amount {
-//!             return Err(bdk::Error::InsufficientFunds);
+//!         let amount_needed_with_fees = (fee_amount + additional_fees).ceil() as u64 + amount_needed;
+//!         if  amount_needed_with_fees > selected_amount {
+//!             return Err(bdk::Error::InsufficientFunds{ needed: amount_needed_with_fees, available: selected_amount });
 //!         }
 //!
 //!         Ok(CoinSelectionResult {
@@ -83,14 +81,16 @@
 //!     }
 //! }
 //!
-//! # let wallet: OfflineWallet<_> = Wallet::new_offline("", None, Network::Testnet, bdk::database::MemoryDatabase::default())?;
+//! # let wallet = doctest_wallet!();
 //! // create wallet, sync, ...
 //!
 //! let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap();
-//! let (psbt, details) = wallet.create_tx(
-//!     TxBuilder::with_recipients(vec![(to_address.script_pubkey(), 50_000)])
-//!         .coin_selection(AlwaysSpendEverything),
-//! )?;
+//! let (psbt, details) = {
+//!     let mut builder = wallet.build_tx().coin_selection(AlwaysSpendEverything);
+//!     builder
+//!         .add_recipient(to_address.script_pubkey(), 50_000);
+//!     builder.finish()?
+//! };
 //!
 //! // inspect, sign, broadcast, ...
 //!
@@ -114,9 +114,9 @@ pub type DefaultCoinSelectionAlgorithm = BranchAndBoundCoinSelection;
 #[cfg(test)]
 pub type DefaultCoinSelectionAlgorithm = LargestFirstCoinSelection; // make the tests more predictable
 
-// Base weight of a Txin, not counting the weight needed for satisfaying it.
+// Base weight of a Txin, not counting the weight needed for satisfying it.
 // prev_txid (32 bytes) + prev_vout (4 bytes) + sequence (4 bytes) + script_len (1 bytes)
-pub const TXIN_BASE_WEIGHT: usize = (32 + 4 + 4 + 1) * 4;
+pub(crate) const TXIN_BASE_WEIGHT: usize = (32 + 4 + 4 + 1) * 4;
 
 /// Result of a successful coin selection
 #[derive(Debug)]
@@ -220,8 +220,12 @@ impl<D: Database> CoinSelectionAlgorithm<D> for LargestFirstCoinSelection {
             )
             .collect::<Vec<_>>();
 
-        if selected_amount < amount_needed + (fee_amount.ceil() as u64) {
-            return Err(Error::InsufficientFunds);
+        let amount_needed_with_fees = amount_needed + (fee_amount.ceil() as u64);
+        if selected_amount < amount_needed_with_fees {
+            return Err(Error::InsufficientFunds {
+                needed: amount_needed_with_fees,
+                available: selected_amount,
+            });
         }
 
         Ok(CoinSelectionResult {
@@ -257,8 +261,9 @@ impl OutputGroup {
     }
 }
 
-/// Branch and bound coin selection. Code adapted from Bitcoin Core's implementation and from Mark
-/// Erhardt Master's Thesis (http://murch.one/wp-content/uploads/2016/11/erhardt2016coinselection.pdf)
+/// Branch and bound coin selection
+///
+/// Code adapted from Bitcoin Core's implementation and from Mark Erhardt Master's Thesis: <http://murch.one/wp-content/uploads/2016/11/erhardt2016coinselection.pdf>
 #[derive(Debug)]
 pub struct BranchAndBoundCoinSelection {
     size_of_change: u64,
@@ -274,6 +279,7 @@ impl Default for BranchAndBoundCoinSelection {
 }
 
 impl BranchAndBoundCoinSelection {
+    /// Create new instance with target size for change output
     pub fn new(size_of_change: u64) -> Self {
         Self { size_of_change }
     }
@@ -318,7 +324,10 @@ impl<D: Database> CoinSelectionAlgorithm<D> for BranchAndBoundCoinSelection {
         let cost_of_change = self.size_of_change as f32 * fee_rate.as_sat_vb();
 
         if curr_available_value + curr_value < actual_target {
-            return Err(Error::InsufficientFunds);
+            return Err(Error::InsufficientFunds {
+                needed: actual_target,
+                available: curr_available_value + curr_value,
+            });
         }
 
         Ok(self
@@ -538,7 +547,7 @@ mod test {
                         value: 100_000,
                         script_pubkey: Script::new(),
                     },
-                    is_internal: false,
+                    keychain: KeychainKind::External,
                 },
                 P2WPKH_WITNESS_SIZE,
             ),
@@ -552,7 +561,7 @@ mod test {
                         value: 200_000,
                         script_pubkey: Script::new(),
                     },
-                    is_internal: true,
+                    keychain: KeychainKind::Internal,
                 },
                 P2WPKH_WITNESS_SIZE,
             ),
@@ -572,7 +581,7 @@ mod test {
                         value: rng.gen_range(0, 200000000),
                         script_pubkey: Script::new(),
                     },
-                    is_internal: false,
+                    keychain: KeychainKind::External,
                 },
                 P2WPKH_WITNESS_SIZE,
             ));
@@ -591,7 +600,7 @@ mod test {
                     value: utxos_value,
                     script_pubkey: Script::new(),
                 },
-                is_internal: false,
+                keychain: KeychainKind::External,
             },
             P2WPKH_WITNESS_SIZE,
         );

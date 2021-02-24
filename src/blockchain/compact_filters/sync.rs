@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bitcoin::hash_types::{BlockHash, FilterHash};
+use bitcoin::hash_types::{BlockHash, FilterHeader};
 use bitcoin::network::message::NetworkMessage;
 use bitcoin::network::message_blockdata::GetHeadersMessage;
 use bitcoin::util::bip158::BlockFilter;
@@ -42,7 +42,7 @@ pub struct CFSync {
     headers_store: Arc<ChainStore<Full>>,
     cf_store: Arc<CFStore>,
     skip_blocks: usize,
-    bundles: Mutex<VecDeque<(BundleStatus, FilterHash, usize)>>,
+    bundles: Mutex<VecDeque<(BundleStatus, FilterHeader, usize)>>,
 }
 
 impl CFSync {
@@ -148,7 +148,7 @@ impl CFSync {
 
                 let resp = peer.get_cf_headers(0x00, start_height as u32, stop_hash)?;
 
-                assert!(resp.previous_filter == checkpoint);
+                assert!(resp.previous_filter_header == checkpoint);
                 status =
                     self.cf_store
                         .advance_to_cf_headers(index, checkpoint, resp.filter_hashes)?;
@@ -204,9 +204,8 @@ impl CFSync {
             if let BundleStatus::CFilters { cf_filters } = status {
                 log::trace!("status: CFilters");
 
-                let last_sync_buried_height = (start_height + already_processed)
-                    .checked_sub(BURIED_CONFIRMATIONS)
-                    .unwrap_or(0);
+                let last_sync_buried_height =
+                    (start_height + already_processed).saturating_sub(BURIED_CONFIRMATIONS);
 
                 for (filter_index, filter) in cf_filters.iter().enumerate() {
                     let height = filter_index + start_height;
@@ -280,10 +279,7 @@ where
 
         match locators_map.get(&headers[0].prev_blockhash) {
             None => return Err(CompactFiltersError::InvalidHeaders),
-            Some(from) => (
-                store.start_snapshot(*from)?,
-                headers[0].prev_blockhash.clone(),
-            ),
+            Some(from) => (store.start_snapshot(*from)?, headers[0].prev_blockhash),
         }
     } else {
         return Err(CompactFiltersError::InvalidResponse);
