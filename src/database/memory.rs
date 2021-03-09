@@ -1,26 +1,13 @@
-// Magical Bitcoin Library
-// Written in 2020 by
-//     Alekos Filini <alekos.filini@gmail.com>
+// Bitcoin Dev Kit
+// Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
-// Copyright (c) 2020 Magical Bitcoin
+// Copyright (c) 2020-2021 Bitcoin Dev Kit Developers
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
 //! In-memory ephemeral database
 //!
@@ -157,7 +144,7 @@ impl BatchOperations for MemoryDatabase {
         Ok(())
     }
 
-    fn set_utxo(&mut self, utxo: &UTXO) -> Result<(), Error> {
+    fn set_utxo(&mut self, utxo: &LocalUtxo) -> Result<(), Error> {
         let key = MapKey::UTXO(Some(&utxo.outpoint)).as_map_key();
         self.map
             .insert(key, Box::new((utxo.txout.clone(), utxo.keychain)));
@@ -223,7 +210,7 @@ impl BatchOperations for MemoryDatabase {
             }
         }
     }
-    fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
+    fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error> {
         let key = MapKey::UTXO(Some(outpoint)).as_map_key();
         let res = self.map.remove(&key);
         self.deleted_keys.push(key);
@@ -232,7 +219,7 @@ impl BatchOperations for MemoryDatabase {
             None => Ok(None),
             Some(b) => {
                 let (txout, keychain) = b.downcast_ref().cloned().unwrap();
-                Ok(Some(UTXO {
+                Ok(Some(LocalUtxo {
                     outpoint: *outpoint,
                     txout,
                     keychain,
@@ -316,14 +303,14 @@ impl Database for MemoryDatabase {
             .collect()
     }
 
-    fn iter_utxos(&self) -> Result<Vec<UTXO>, Error> {
+    fn iter_utxos(&self) -> Result<Vec<LocalUtxo>, Error> {
         let key = MapKey::UTXO(None).as_map_key();
         self.map
             .range::<Vec<u8>, _>((Included(&key), Excluded(&after(&key))))
             .map(|(k, v)| {
                 let outpoint = deserialize(&k[1..]).unwrap();
                 let (txout, keychain) = v.downcast_ref().cloned().unwrap();
-                Ok(UTXO {
+                Ok(LocalUtxo {
                     outpoint,
                     txout,
                     keychain,
@@ -382,11 +369,11 @@ impl Database for MemoryDatabase {
         }))
     }
 
-    fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
+    fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error> {
         let key = MapKey::UTXO(Some(outpoint)).as_map_key();
         Ok(self.map.get(&key).map(|b| {
             let (txout, keychain) = b.downcast_ref().cloned().unwrap();
-            UTXO {
+            LocalUtxo {
                 outpoint: *outpoint,
                 txout,
                 keychain,
@@ -502,7 +489,7 @@ macro_rules! populate_test_db {
 
         db.set_tx(&tx_details).unwrap();
         for (vout, out) in tx.output.iter().enumerate() {
-            db.set_utxo(&UTXO {
+            db.set_utxo(&LocalUtxo {
                 txout: out.clone(),
                 outpoint: OutPoint {
                     txid,

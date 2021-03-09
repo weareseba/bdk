@@ -1,26 +1,13 @@
-// Magical Bitcoin Library
-// Written in 2020 by
-//     Alekos Filini <alekos.filini@gmail.com>
+// Bitcoin Dev Kit
+// Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
-// Copyright (c) 2020 Magical Bitcoin
+// Copyright (c) 2020-2021 Bitcoin Dev Kit Developers
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
 #[macro_use]
 extern crate serde_json;
@@ -60,13 +47,13 @@ fn get_auth() -> Auth {
         ),
         _ => Auth::CookieFile(PathBuf::from(
             env::var("BDK_RPC_COOKIEFILE")
-                .unwrap_or("/home/user/.bitcoin/regtest/.cookie".to_string()),
+                .unwrap_or_else(|_| "/home/user/.bitcoin/regtest/.cookie".to_string()),
         )),
     }
 }
 
 pub fn get_electrum_url() -> String {
-    env::var("BDK_ELECTRUM_URL").unwrap_or("tcp://127.0.0.1:50001".to_string())
+    env::var("BDK_ELECTRUM_URL").unwrap_or_else(|_| "tcp://127.0.0.1:50001".to_string())
 }
 
 pub struct TestClient {
@@ -311,8 +298,8 @@ where
 
 impl TestClient {
     pub fn new() -> Self {
-        let url = env::var("BDK_RPC_URL").unwrap_or("127.0.0.1:18443".to_string());
-        let wallet = env::var("BDK_RPC_WALLET").unwrap_or("bdk-test".to_string());
+        let url = env::var("BDK_RPC_URL").unwrap_or_else(|_| "127.0.0.1:18443".to_string());
+        let wallet = env::var("BDK_RPC_WALLET").unwrap_or_else(|_| "bdk-test".to_string());
         let client =
             RpcClient::new(format!("http://{}/wallet/{}", url, wallet), get_auth()).unwrap();
         let electrum = ElectrumClient::new(&get_electrum_url()).unwrap();
@@ -349,7 +336,7 @@ impl TestClient {
 
     pub fn receive(&mut self, meta_tx: TestIncomingTx) -> Txid {
         assert!(
-            meta_tx.output.len() > 0,
+            !meta_tx.output.is_empty(),
             "can't create a transaction with no outputs"
         );
 

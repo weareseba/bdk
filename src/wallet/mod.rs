@@ -1,26 +1,13 @@
-// Magical Bitcoin Library
-// Written in 2020 by
-//     Alekos Filini <alekos.filini@gmail.com>
+// Bitcoin Dev Kit
+// Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
-// Copyright (c) 2020 Magical Bitcoin
+// Copyright (c) 2020-2021 Bitcoin Dev Kit Developers
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
 //! Wallet
 //!
@@ -200,13 +187,13 @@ where
     ///
     /// Note that this methods only operate on the internal database, which first needs to be
     /// [`Wallet::sync`] manually.
-    pub fn list_unspent(&self) -> Result<Vec<UTXO>, Error> {
+    pub fn list_unspent(&self) -> Result<Vec<LocalUtxo>, Error> {
         self.database.borrow().iter_utxos()
     }
 
     /// Returns the `UTXO` owned by this wallet corresponding to `outpoint` if it exists in the
     /// wallet's database.
-    pub fn get_utxo(&self, outpoint: OutPoint) -> Result<Option<UTXO>, Error> {
+    pub fn get_utxo(&self, outpoint: OutPoint) -> Result<Option<LocalUtxo>, Error> {
         self.database.borrow().get_utxo(&outpoint)
     }
 
@@ -514,11 +501,7 @@ where
             params.bumping_fee.is_some(), // we mandate confirmed transactions if we're bumping the fee
         )?;
 
-        let coin_selection::CoinSelectionResult {
-            selected,
-            selected_amount,
-            mut fee_amount,
-        } = coin_selection.coin_select(
+        let coin_selection = coin_selection.coin_select(
             self.database.borrow().deref(),
             required_utxos,
             optional_utxos,
@@ -526,10 +509,13 @@ where
             outgoing,
             fee_amount,
         )?;
-        tx.input = selected
+        let mut fee_amount = coin_selection.fee_amount;
+
+        tx.input = coin_selection
+            .selected
             .iter()
             .map(|u| bitcoin::TxIn {
-                previous_output: u.outpoint,
+                previous_output: u.outpoint(),
                 script_sig: Script::default(),
                 sequence: n_sequence,
                 witness: vec![],
@@ -551,9 +537,8 @@ where
                 Some(change_output)
             }
         };
-
         let mut fee_amount = fee_amount.ceil() as u64;
-        let change_val = (selected_amount - outgoing).saturating_sub(fee_amount);
+        let change_val = (coin_selection.selected_amount() - outgoing).saturating_sub(fee_amount);
 
         match change_output {
             None if change_val.is_dust() => {
@@ -589,14 +574,15 @@ where
         params.ordering.sort_tx(&mut tx);
 
         let txid = tx.txid();
-        let psbt = self.complete_transaction(tx, selected, params)?;
+        let sent = coin_selection.local_selected_amount();
+        let psbt = self.complete_transaction(tx, coin_selection.selected, params)?;
 
         let transaction_details = TransactionDetails {
             transaction: None,
             txid,
             timestamp: time::get_timestamp(),
             received,
-            sent: selected_amount,
+            sent,
             fees: fee_amount,
             height: None,
         };
@@ -700,13 +686,16 @@ where
                     }
                 };
 
-                let utxo = UTXO {
+                let utxo = LocalUtxo {
                     outpoint: txin.previous_output,
                     txout,
                     keychain,
                 };
 
-                Ok((utxo, weight))
+                Ok(WeightedUtxo {
+                    satisfaction_weight: weight,
+                    utxo: Utxo::Local(utxo),
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1017,7 +1006,7 @@ where
         Ok(())
     }
 
-    fn get_available_utxos(&self) -> Result<Vec<(UTXO, usize)>, Error> {
+    fn get_available_utxos(&self) -> Result<Vec<(LocalUtxo, usize)>, Error> {
         Ok(self
             .list_unspent()?
             .into_iter()
@@ -1040,18 +1029,18 @@ where
         &self,
         change_policy: tx_builder::ChangeSpendPolicy,
         unspendable: &HashSet<OutPoint>,
-        manually_selected: Vec<(UTXO, usize)>,
+        manually_selected: Vec<WeightedUtxo>,
         must_use_all_available: bool,
         manual_only: bool,
         must_only_use_confirmed_tx: bool,
-    ) -> Result<(Vec<(UTXO, usize)>, Vec<(UTXO, usize)>), Error> {
+    ) -> Result<(Vec<WeightedUtxo>, Vec<WeightedUtxo>), Error> {
         //    must_spend <- manually selected utxos
         //    may_spend  <- all other available utxos
         let mut may_spend = self.get_available_utxos()?;
         may_spend.retain(|may_spend| {
             manually_selected
                 .iter()
-                .find(|manually_selected| manually_selected.0.outpoint == may_spend.0.outpoint)
+                .find(|manually_selected| manually_selected.utxo.outpoint() == may_spend.0.outpoint)
                 .is_none()
         });
         let mut must_spend = manually_selected;
@@ -1089,6 +1078,14 @@ where
             retain
         });
 
+        let mut may_spend = may_spend
+            .into_iter()
+            .map(|(local_utxo, satisfaction_weight)| WeightedUtxo {
+                satisfaction_weight,
+                utxo: Utxo::Local(local_utxo),
+            })
+            .collect();
+
         if must_use_all_available {
             must_spend.append(&mut may_spend);
         }
@@ -1099,7 +1096,7 @@ where
     fn complete_transaction(
         &self,
         tx: Transaction,
-        selected: Vec<UTXO>,
+        selected: Vec<Utxo>,
         params: TxParams,
     ) -> Result<PSBT, Error> {
         use bitcoin::util::psbt::serialize::Serialize;
@@ -1132,9 +1129,9 @@ where
             }
         }
 
-        let lookup_output = selected
+        let mut lookup_output = selected
             .into_iter()
-            .map(|utxo| (utxo.outpoint, utxo))
+            .map(|utxo| (utxo.outpoint(), utxo))
             .collect::<HashMap<_, _>>();
 
         // add metadata for the inputs
@@ -1143,7 +1140,7 @@ where
             .iter_mut()
             .zip(psbt.global.unsigned_tx.input.iter())
         {
-            let utxo = match lookup_output.get(&input.previous_output) {
+            let utxo = match lookup_output.remove(&input.previous_output) {
                 Some(utxo) => utxo,
                 None => continue,
             };
@@ -1154,32 +1151,50 @@ where
                 psbt_input.sighash_type = Some(sighash_type);
             }
 
-            // Try to find the prev_script in our db to figure out if this is internal or external,
-            // and the derivation index
-            let (keychain, child) = match self
-                .database
-                .borrow()
-                .get_path_from_script_pubkey(&utxo.txout.script_pubkey)?
-            {
-                Some(x) => x,
-                None => continue,
-            };
+            match utxo {
+                Utxo::Local(utxo) => {
+                    // Try to find the prev_script in our db to figure out if this is internal or external,
+                    // and the derivation index
+                    let (keychain, child) = match self
+                        .database
+                        .borrow()
+                        .get_path_from_script_pubkey(&utxo.txout.script_pubkey)?
+                    {
+                        Some(x) => x,
+                        None => continue,
+                    };
 
-            let (desc, _) = self._get_descriptor_for_keychain(keychain);
-            let derived_descriptor = desc.as_derived(child, &self.secp);
-            psbt_input.bip32_derivation = derived_descriptor.get_hd_keypaths(&self.secp)?;
+                    let desc = self.get_descriptor_for_keychain(keychain);
+                    let derived_descriptor = desc.as_derived(child, &self.secp);
+                    psbt_input.bip32_derivation = derived_descriptor.get_hd_keypaths(&self.secp)?;
 
-            psbt_input.redeem_script = derived_descriptor.psbt_redeem_script();
-            psbt_input.witness_script = derived_descriptor.psbt_witness_script();
+                    psbt_input.redeem_script = derived_descriptor.psbt_redeem_script();
+                    psbt_input.witness_script = derived_descriptor.psbt_witness_script();
 
-            let prev_output = input.previous_output;
-            if let Some(prev_tx) = self.database.borrow().get_raw_tx(&prev_output.txid)? {
-                if desc.is_witness() {
-                    psbt_input.witness_utxo =
-                        Some(prev_tx.output[prev_output.vout as usize].clone());
+                    let prev_output = input.previous_output;
+                    if let Some(prev_tx) = self.database.borrow().get_raw_tx(&prev_output.txid)? {
+                        if desc.is_witness() {
+                            psbt_input.witness_utxo =
+                                Some(prev_tx.output[prev_output.vout as usize].clone());
+                        }
+                        if !desc.is_witness() || params.force_non_witness_utxo {
+                            psbt_input.non_witness_utxo = Some(prev_tx);
+                        }
+                    }
                 }
-                if !desc.is_witness() || params.force_non_witness_utxo {
-                    psbt_input.non_witness_utxo = Some(prev_tx);
+                Utxo::Foreign {
+                    psbt_input: foreign_psbt_input,
+                    outpoint,
+                } => {
+                    if params.force_non_witness_utxo
+                        && foreign_psbt_input.non_witness_utxo.is_none()
+                    {
+                        return Err(Error::Generic(format!(
+                            "Missing non_witness_utxo on foreign utxo {}",
+                            outpoint
+                        )));
+                    }
+                    *psbt_input = *foreign_psbt_input;
                 }
             }
         }
@@ -1349,7 +1364,7 @@ where
 mod test {
     use std::str::FromStr;
 
-    use bitcoin::Network;
+    use bitcoin::{util::psbt, Network};
 
     use crate::database::memory::MemoryDatabase;
     use crate::database::Database;
@@ -1943,7 +1958,7 @@ mod test {
 
         assert_eq!(psbt.inputs[0].bip32_derivation.len(), 1);
         assert_eq!(
-            psbt.inputs[0].bip32_derivation.values().nth(0).unwrap(),
+            psbt.inputs[0].bip32_derivation.values().next().unwrap(),
             &(
                 Fingerprint::from_str("d34db33f").unwrap(),
                 DerivationPath::from_str("m/44'/0'/0'/0/0").unwrap()
@@ -1969,7 +1984,7 @@ mod test {
 
         assert_eq!(psbt.outputs[0].bip32_derivation.len(), 1);
         assert_eq!(
-            psbt.outputs[0].bip32_derivation.values().nth(0).unwrap(),
+            psbt.outputs[0].bip32_derivation.values().next().unwrap(),
             &(
                 Fingerprint::from_str("d34db33f").unwrap(),
                 DerivationPath::from_str("m/44'/0'/0'/0/5").unwrap()
@@ -2236,6 +2251,187 @@ mod test {
 
         assert_eq!(psbt.global.unknown.len(), 1);
         assert_eq!(psbt.global.unknown.get(&psbt_key), Some(&value_bytes));
+    }
+
+    #[test]
+    fn test_add_foreign_utxo() {
+        let (wallet1, _, _) = get_funded_wallet(get_test_wpkh());
+        let (wallet2, _, _) =
+            get_funded_wallet("wpkh(cVbZ8ovhye9AoAHFsqobCf7LxbXDAECy9Kb8TZdfsDYMZGBUyCnm)");
+        let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
+        let utxo = wallet2.list_unspent().unwrap().remove(0);
+        let foreign_utxo_satisfaction = wallet2
+            .get_descriptor_for_keychain(KeychainKind::External)
+            .max_satisfaction_weight()
+            .unwrap();
+
+        let psbt_input = psbt::Input {
+            witness_utxo: Some(utxo.txout.clone()),
+            ..Default::default()
+        };
+
+        let mut builder = wallet1.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 60_000)
+            .add_foreign_utxo(utxo.outpoint, psbt_input, foreign_utxo_satisfaction)
+            .unwrap();
+        let (psbt, details) = builder.finish().unwrap();
+
+        assert_eq!(
+            details.sent - details.received,
+            10_000 + details.fees,
+            "we should have only net spent ~10_000"
+        );
+
+        assert!(
+            psbt.global
+                .unsigned_tx
+                .input
+                .iter()
+                .find(|input| input.previous_output == utxo.outpoint)
+                .is_some(),
+            "foreign_utxo should be in there"
+        );
+
+        let (psbt, finished) = wallet1.sign(psbt, None).unwrap();
+
+        assert!(
+            !finished,
+            "only one of the inputs should have been signed so far"
+        );
+
+        let (_, finished) = wallet2.sign(psbt, None).unwrap();
+        assert!(finished, "all the inputs should have been signed now");
+    }
+
+    #[test]
+    #[should_panic(expected = "Generic(\"Foreign utxo missing witness_utxo or non_witness_utxo\")")]
+    fn test_add_foreign_utxo_invalid_psbt_input() {
+        let (wallet, _, _) = get_funded_wallet(get_test_wpkh());
+        let mut builder = wallet.build_tx();
+        let outpoint = wallet.list_unspent().unwrap()[0].outpoint;
+        let foreign_utxo_satisfaction = wallet
+            .get_descriptor_for_keychain(KeychainKind::External)
+            .max_satisfaction_weight()
+            .unwrap();
+        builder
+            .add_foreign_utxo(outpoint, psbt::Input::default(), foreign_utxo_satisfaction)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_add_foreign_utxo_where_outpoint_doesnt_match_psbt_input() {
+        let (wallet1, _, txid1) = get_funded_wallet(get_test_wpkh());
+        let (wallet2, _, txid2) =
+            get_funded_wallet("wpkh(cVbZ8ovhye9AoAHFsqobCf7LxbXDAECy9Kb8TZdfsDYMZGBUyCnm)");
+
+        let utxo2 = wallet2.list_unspent().unwrap().remove(0);
+        let tx1 = wallet1
+            .database
+            .borrow()
+            .get_tx(&txid1, true)
+            .unwrap()
+            .unwrap()
+            .transaction
+            .unwrap();
+        let tx2 = wallet2
+            .database
+            .borrow()
+            .get_tx(&txid2, true)
+            .unwrap()
+            .unwrap()
+            .transaction
+            .unwrap();
+
+        let satisfaction_weight = wallet2
+            .get_descriptor_for_keychain(KeychainKind::External)
+            .max_satisfaction_weight()
+            .unwrap();
+
+        let mut builder = wallet1.build_tx();
+        assert!(
+            builder
+                .add_foreign_utxo(
+                    utxo2.outpoint,
+                    psbt::Input {
+                        non_witness_utxo: Some(tx1),
+                        ..Default::default()
+                    },
+                    satisfaction_weight
+                )
+                .is_err(),
+            "should fail when outpoint doesn't match psbt_input"
+        );
+        assert!(
+            builder
+                .add_foreign_utxo(
+                    utxo2.outpoint,
+                    psbt::Input {
+                        non_witness_utxo: Some(tx2),
+                        ..Default::default()
+                    },
+                    satisfaction_weight
+                )
+                .is_ok(),
+            "shoulld be ok when outpoint does match psbt_input"
+        );
+    }
+
+    #[test]
+    fn test_add_foreign_utxo_force_non_witness_utxo() {
+        let (wallet1, _, _) = get_funded_wallet(get_test_wpkh());
+        let (wallet2, _, txid2) =
+            get_funded_wallet("wpkh(cVbZ8ovhye9AoAHFsqobCf7LxbXDAECy9Kb8TZdfsDYMZGBUyCnm)");
+        let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
+        let utxo2 = wallet2.list_unspent().unwrap().remove(0);
+
+        let satisfaction_weight = wallet2
+            .get_descriptor_for_keychain(KeychainKind::External)
+            .max_satisfaction_weight()
+            .unwrap();
+
+        let mut builder = wallet1.build_tx();
+        builder
+            .add_recipient(addr.script_pubkey(), 60_000)
+            .force_non_witness_utxo();
+
+        {
+            let mut builder = builder.clone();
+            let psbt_input = psbt::Input {
+                witness_utxo: Some(utxo2.txout.clone()),
+                ..Default::default()
+            };
+            builder
+                .add_foreign_utxo(utxo2.outpoint, psbt_input, satisfaction_weight)
+                .unwrap();
+            assert!(
+                builder.finish().is_err(),
+                "psbt_input with witness_utxo should fail with only witness_utxo"
+            );
+        }
+
+        {
+            let mut builder = builder.clone();
+            let tx2 = wallet2
+                .database
+                .borrow()
+                .get_tx(&txid2, true)
+                .unwrap()
+                .unwrap()
+                .transaction
+                .unwrap();
+            let psbt_input = psbt::Input {
+                non_witness_utxo: Some(tx2),
+                ..Default::default()
+            };
+            builder
+                .add_foreign_utxo(utxo2.outpoint, psbt_input, satisfaction_weight)
+                .unwrap();
+            assert!(
+                builder.finish().is_ok(),
+                "psbt_input with non_witness_utxo should succeed with force_non_witness_utxo"
+            );
+        }
     }
 
     #[test]
@@ -3221,15 +3417,18 @@ mod test {
         let (mut psbt, _) = builder.finish().unwrap();
 
         // add another input to the psbt that is at least passable.
-        let mut dud_input = bitcoin::util::psbt::Input::default();
-        dud_input.witness_utxo = Some(TxOut {
-            value: 100_000,
-            script_pubkey: miniscript::Descriptor::<bitcoin::PublicKey>::from_str(
-                "wpkh(025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee6357)",
-            )
-            .unwrap()
-            .script_pubkey(),
-        });
+        let dud_input = bitcoin::util::psbt::Input {
+            witness_utxo: Some(TxOut {
+                value: 100_000,
+                script_pubkey: miniscript::Descriptor::<bitcoin::PublicKey>::from_str(
+                    "wpkh(025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee6357)",
+                )
+                .unwrap()
+                .script_pubkey(),
+            }),
+            ..Default::default()
+        };
+
         psbt.inputs.push(dud_input);
         psbt.global.unsigned_tx.input.push(bitcoin::TxIn::default());
         let (psbt, is_final) = wallet.sign(psbt, None).unwrap();

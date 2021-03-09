@@ -9,7 +9,7 @@ documentation = "https://docs.rs/bdk"
 description = "A modern, lightweight, descriptor-based wallet library"
 keywords = ["bitcoin", "wallet", "descriptor", "psbt"]
 readme = "README.md"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 bdk-macros = "^0.3"
@@ -25,7 +25,7 @@ bitcoinconsensus = "0.17.1"
 
 # Optional dependencies
 sled = { version = "0.34", optional = true }
-electrum-client = { version = "0.6", optional = true }
+electrum-client = { version = "0.7", optional = true }
 reqwest = { version = "0.11", optional = true, features = ["json"] }
 futures = { version = "0.3", optional = true }
 clap = { version = "2.33", optional = true }

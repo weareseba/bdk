@@ -1,26 +1,13 @@
-// Magical Bitcoin Library
-// Written in 2020 by
-//     Alekos Filini <alekos.filini@gmail.com>
+// Bitcoin Dev Kit
+// Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
-// Copyright (c) 2020 Magical Bitcoin
+// Copyright (c) 2020-2021 Bitcoin Dev Kit Developers
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
 //! Descriptor templates
 //!
@@ -75,7 +62,7 @@ impl<T: DescriptorTemplate> IntoWalletDescriptor for T {
         secp: &SecpCtx,
         network: Network,
     ) -> Result<(ExtendedDescriptor, KeyMap), DescriptorError> {
-        Ok(self.build()?.into_wallet_descriptor(secp, network)?)
+        self.build()?.into_wallet_descriptor(secp, network)
     }
 }
 
@@ -108,7 +95,7 @@ pub struct P2PKH<K: IntoDescriptorKey<Legacy>>(pub K);
 
 impl<K: IntoDescriptorKey<Legacy>> DescriptorTemplate for P2PKH<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(descriptor!(pkh(self.0))?)
+        descriptor!(pkh(self.0))
     }
 }
 
@@ -142,7 +129,7 @@ pub struct P2WPKH_P2SH<K: IntoDescriptorKey<Segwitv0>>(pub K);
 
 impl<K: IntoDescriptorKey<Segwitv0>> DescriptorTemplate for P2WPKH_P2SH<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(descriptor!(sh(wpkh(self.0)))?)
+        descriptor!(sh(wpkh(self.0)))
     }
 }
 
@@ -175,7 +162,7 @@ pub struct P2WPKH<K: IntoDescriptorKey<Segwitv0>>(pub K);
 
 impl<K: IntoDescriptorKey<Segwitv0>> DescriptorTemplate for P2WPKH<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(descriptor!(wpkh(self.0))?)
+        descriptor!(wpkh(self.0))
     }
 }
 
@@ -210,7 +197,7 @@ pub struct BIP44<K: DerivableKey<Legacy>>(pub K, pub KeychainKind);
 
 impl<K: DerivableKey<Legacy>> DescriptorTemplate for BIP44<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(P2PKH(legacy::make_bipxx_private(44, self.0, self.1)?).build()?)
+        P2PKH(legacy::make_bipxx_private(44, self.0, self.1)?).build()
     }
 }
 
@@ -249,7 +236,7 @@ pub struct BIP44Public<K: DerivableKey<Legacy>>(pub K, pub bip32::Fingerprint, p
 
 impl<K: DerivableKey<Legacy>> DescriptorTemplate for BIP44Public<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(P2PKH(legacy::make_bipxx_public(44, self.0, self.1, self.2)?).build()?)
+        P2PKH(legacy::make_bipxx_public(44, self.0, self.1, self.2)?).build()
     }
 }
 
@@ -284,7 +271,7 @@ pub struct BIP49<K: DerivableKey<Segwitv0>>(pub K, pub KeychainKind);
 
 impl<K: DerivableKey<Segwitv0>> DescriptorTemplate for BIP49<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(P2WPKH_P2SH(segwit_v0::make_bipxx_private(49, self.0, self.1)?).build()?)
+        P2WPKH_P2SH(segwit_v0::make_bipxx_private(49, self.0, self.1)?).build()
     }
 }
 
@@ -323,7 +310,7 @@ pub struct BIP49Public<K: DerivableKey<Segwitv0>>(pub K, pub bip32::Fingerprint,
 
 impl<K: DerivableKey<Segwitv0>> DescriptorTemplate for BIP49Public<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(P2WPKH_P2SH(segwit_v0::make_bipxx_public(49, self.0, self.1, self.2)?).build()?)
+        P2WPKH_P2SH(segwit_v0::make_bipxx_public(49, self.0, self.1, self.2)?).build()
     }
 }
 
@@ -358,7 +345,7 @@ pub struct BIP84<K: DerivableKey<Segwitv0>>(pub K, pub KeychainKind);
 
 impl<K: DerivableKey<Segwitv0>> DescriptorTemplate for BIP84<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(P2WPKH(segwit_v0::make_bipxx_private(84, self.0, self.1)?).build()?)
+        P2WPKH(segwit_v0::make_bipxx_private(84, self.0, self.1)?).build()
     }
 }
 
@@ -397,7 +384,7 @@ pub struct BIP84Public<K: DerivableKey<Segwitv0>>(pub K, pub bip32::Fingerprint,
 
 impl<K: DerivableKey<Segwitv0>> DescriptorTemplate for BIP84Public<K> {
     fn build(self) -> Result<DescriptorTemplateOut, DescriptorError> {
-        Ok(P2WPKH(segwit_v0::make_bipxx_public(84, self.0, self.1, self.2)?).build()?)
+        P2WPKH(segwit_v0::make_bipxx_public(84, self.0, self.1, self.2)?).build()
     }
 }
 
@@ -440,11 +427,11 @@ macro_rules! expand_make_bipxx {
                     KeychainKind::Internal => vec![bip32::ChildNumber::from_normal_idx(1)?].into(),
                 };
 
-                let mut source_path = Vec::with_capacity(3);
-                source_path.push(bip32::ChildNumber::from_hardened_idx(bip)?);
-                source_path.push(bip32::ChildNumber::from_hardened_idx(0)?);
-                source_path.push(bip32::ChildNumber::from_hardened_idx(0)?);
-                let source_path: bip32::DerivationPath = source_path.into();
+                let source_path = bip32::DerivationPath::from(vec![
+                    bip32::ChildNumber::from_hardened_idx(bip)?,
+                    bip32::ChildNumber::from_hardened_idx(0)?,
+                    bip32::ChildNumber::from_hardened_idx(0)?,
+                ]);
 
                 Ok((key, (parent_fingerprint, source_path), derivation_path))
             }

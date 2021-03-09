@@ -1,26 +1,13 @@
-// Magical Bitcoin Library
-// Written in 2020 by
-//     Alekos Filini <alekos.filini@gmail.com>
+// Bitcoin Dev Kit
+// Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
-// Copyright (c) 2020 Magical Bitcoin
+// Copyright (c) 2020-2021 Bitcoin Dev Kit Developers
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
 //! Database types
 //!
@@ -64,8 +51,8 @@ pub trait BatchOperations {
         keychain: KeychainKind,
         child: u32,
     ) -> Result<(), Error>;
-    /// Store a [`UTXO`]
-    fn set_utxo(&mut self, utxo: &UTXO) -> Result<(), Error>;
+    /// Store a [`LocalUtxo`]
+    fn set_utxo(&mut self, utxo: &LocalUtxo) -> Result<(), Error>;
     /// Store a raw transaction
     fn set_raw_tx(&mut self, transaction: &Transaction) -> Result<(), Error>;
     /// Store the metadata of a transaction
@@ -85,8 +72,8 @@ pub trait BatchOperations {
         &mut self,
         script: &Script,
     ) -> Result<Option<(KeychainKind, u32)>, Error>;
-    /// Delete a [`UTXO`] given its [`OutPoint`]
-    fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error>;
+    /// Delete a [`LocalUtxo`] given its [`OutPoint`]
+    fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error>;
     /// Delete a raw transaction given its [`Txid`]
     fn del_raw_tx(&mut self, txid: &Txid) -> Result<Option<Transaction>, Error>;
     /// Delete the metadata of a transaction and optionally the raw transaction itself
@@ -116,8 +103,8 @@ pub trait Database: BatchOperations {
 
     /// Return the list of script_pubkeys
     fn iter_script_pubkeys(&self, keychain: Option<KeychainKind>) -> Result<Vec<Script>, Error>;
-    /// Return the list of [`UTXO`]s
-    fn iter_utxos(&self) -> Result<Vec<UTXO>, Error>;
+    /// Return the list of [`LocalUtxo`]s
+    fn iter_utxos(&self) -> Result<Vec<LocalUtxo>, Error>;
     /// Return the list of raw transactions
     fn iter_raw_txs(&self) -> Result<Vec<Transaction>, Error>;
     /// Return the list of transactions metadata
@@ -134,8 +121,8 @@ pub trait Database: BatchOperations {
         &self,
         script: &Script,
     ) -> Result<Option<(KeychainKind, u32)>, Error>;
-    /// Fetch a [`UTXO`] given its [`OutPoint`]
-    fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error>;
+    /// Fetch a [`LocalUtxo`] given its [`OutPoint`]
+    fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error>;
     /// Fetch a raw transaction given its [`Txid`]
     fn get_raw_tx(&self, txid: &Txid) -> Result<Option<Transaction>, Error>;
     /// Fetch the transaction metadata and optionally also the raw transaction
@@ -227,7 +214,7 @@ pub mod test {
         );
         assert_eq!(
             tree.get_path_from_script_pubkey(&script).unwrap(),
-            Some((keychain, path.clone()))
+            Some((keychain, path))
         );
     }
 
@@ -256,7 +243,7 @@ pub mod test {
         );
         assert_eq!(
             tree.get_path_from_script_pubkey(&script).unwrap(),
-            Some((keychain, path.clone()))
+            Some((keychain, path))
         );
     }
 
@@ -298,7 +285,7 @@ pub mod test {
             value: 133742,
             script_pubkey: script,
         };
-        let utxo = UTXO {
+        let utxo = LocalUtxo {
             txout,
             outpoint,
             keychain: KeychainKind::External,

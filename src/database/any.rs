@@ -1,26 +1,13 @@
-// Magical Bitcoin Library
-// Written in 2020 by
-//     Alekos Filini <alekos.filini@gmail.com>
+// Bitcoin Dev Kit
+// Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
-// Copyright (c) 2020 Magical Bitcoin
+// Copyright (c) 2020-2021 Bitcoin Dev Kit Developers
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
 //! Runtime-checked database types
 //!
@@ -133,7 +120,7 @@ impl BatchOperations for AnyDatabase {
             child
         )
     }
-    fn set_utxo(&mut self, utxo: &UTXO) -> Result<(), Error> {
+    fn set_utxo(&mut self, utxo: &LocalUtxo) -> Result<(), Error> {
         impl_inner_method!(AnyDatabase, self, set_utxo, utxo)
     }
     fn set_raw_tx(&mut self, transaction: &Transaction) -> Result<(), Error> {
@@ -165,7 +152,7 @@ impl BatchOperations for AnyDatabase {
     ) -> Result<Option<(KeychainKind, u32)>, Error> {
         impl_inner_method!(AnyDatabase, self, del_path_from_script_pubkey, script)
     }
-    fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
+    fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error> {
         impl_inner_method!(AnyDatabase, self, del_utxo, outpoint)
     }
     fn del_raw_tx(&mut self, txid: &Txid) -> Result<Option<Transaction>, Error> {
@@ -201,7 +188,7 @@ impl Database for AnyDatabase {
     fn iter_script_pubkeys(&self, keychain: Option<KeychainKind>) -> Result<Vec<Script>, Error> {
         impl_inner_method!(AnyDatabase, self, iter_script_pubkeys, keychain)
     }
-    fn iter_utxos(&self) -> Result<Vec<UTXO>, Error> {
+    fn iter_utxos(&self) -> Result<Vec<LocalUtxo>, Error> {
         impl_inner_method!(AnyDatabase, self, iter_utxos)
     }
     fn iter_raw_txs(&self) -> Result<Vec<Transaction>, Error> {
@@ -230,7 +217,7 @@ impl Database for AnyDatabase {
     ) -> Result<Option<(KeychainKind, u32)>, Error> {
         impl_inner_method!(AnyDatabase, self, get_path_from_script_pubkey, script)
     }
-    fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
+    fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error> {
         impl_inner_method!(AnyDatabase, self, get_utxo, outpoint)
     }
     fn get_raw_tx(&self, txid: &Txid) -> Result<Option<Transaction>, Error> {
@@ -257,7 +244,7 @@ impl BatchOperations for AnyBatch {
     ) -> Result<(), Error> {
         impl_inner_method!(AnyBatch, self, set_script_pubkey, script, keychain, child)
     }
-    fn set_utxo(&mut self, utxo: &UTXO) -> Result<(), Error> {
+    fn set_utxo(&mut self, utxo: &LocalUtxo) -> Result<(), Error> {
         impl_inner_method!(AnyBatch, self, set_utxo, utxo)
     }
     fn set_raw_tx(&mut self, transaction: &Transaction) -> Result<(), Error> {
@@ -283,7 +270,7 @@ impl BatchOperations for AnyBatch {
     ) -> Result<Option<(KeychainKind, u32)>, Error> {
         impl_inner_method!(AnyBatch, self, del_path_from_script_pubkey, script)
     }
-    fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
+    fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error> {
         impl_inner_method!(AnyBatch, self, del_utxo, outpoint)
     }
     fn del_raw_tx(&mut self, txid: &Txid) -> Result<Option<Transaction>, Error> {
@@ -312,24 +299,17 @@ impl BatchDatabase for AnyDatabase {
         }
     }
     fn commit_batch(&mut self, batch: Self::Batch) -> Result<(), Error> {
-        // TODO: refactor once `move_ref_pattern` is stable
-        #[allow(irrefutable_let_patterns)]
         match self {
-            AnyDatabase::Memory(db) => {
-                if let AnyBatch::Memory(batch) = batch {
-                    db.commit_batch(batch)
-                } else {
-                    unimplemented!()
-                }
-            }
+            AnyDatabase::Memory(db) => match batch {
+                AnyBatch::Memory(batch) => db.commit_batch(batch),
+                #[cfg(feature = "key-value-db")]
+                _ => unimplemented!("Sled batch shouldn't be used with Memory db."),
+            },
             #[cfg(feature = "key-value-db")]
-            AnyDatabase::Sled(db) => {
-                if let AnyBatch::Sled(batch) = batch {
-                    db.commit_batch(batch)
-                } else {
-                    unimplemented!()
-                }
-            }
+            AnyDatabase::Sled(db) => match batch {
+                AnyBatch::Sled(batch) => db.commit_batch(batch),
+                _ => unimplemented!("Memory batch shouldn't be used with Sled db."),
+            },
         }
     }
 }

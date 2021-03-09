@@ -1,33 +1,20 @@
-// Magical Bitcoin Library
-// Written in 2020 by
-//     Alekos Filini <alekos.filini@gmail.com>
+// Bitcoin Dev Kit
+// Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
-// Copyright (c) 2020 Magical Bitcoin
+// Copyright (c) 2020-2021 Bitcoin Dev Kit Developers
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
 //! Descriptors
 //!
 //! This module contains generic utilities to work with descriptors, plus some re-exported types
 //! from [`miniscript`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Deref;
 
 use bitcoin::util::bip32::{
@@ -223,6 +210,24 @@ pub(crate) fn into_wallet_descriptor_checked<T: IntoWalletDescriptor>(
     });
     if descriptor_contains_hardened_steps {
         return Err(DescriptorError::HardenedDerivationXpub);
+    }
+
+    // Ensure that there are no duplicated keys
+    let mut found_keys = HashSet::new();
+    let descriptor_contains_duplicated_keys = descriptor.for_any_key(|k| {
+        if let DescriptorPublicKey::XPub(xkey) = k.as_key() {
+            let fingerprint = xkey.root_fingerprint(secp);
+            if found_keys.contains(&fingerprint) {
+                return true;
+            }
+
+            found_keys.insert(fingerprint);
+        }
+
+        false
+    });
+    if descriptor_contains_duplicated_keys {
+        return Err(DescriptorError::DuplicatedKeys);
     }
 
     Ok((descriptor, keymap))
@@ -782,6 +787,15 @@ mod test {
         assert!(matches!(
             result.unwrap_err(),
             DescriptorError::HardenedDerivationXpub
+        ));
+
+        let descriptor = "wsh(multi(2,tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/0/*,tpubD6NzVbkrYhZ4XHndKkuB8FifXm8r5FQHwrN6oZuWCz13qb93rtgKvD4PQsqC4HP4yhV3tA2fqr2RbY5mNXfM7RxXUoeABoDtsFUq2zJq6YK/1/*))";
+        let result = into_wallet_descriptor_checked(descriptor, &secp, Network::Testnet);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DescriptorError::DuplicatedKeys
         ));
     }
 }

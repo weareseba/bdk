@@ -1,26 +1,13 @@
-// Magical Bitcoin Library
-// Written in 2020 by
-//     Alekos Filini <alekos.filini@gmail.com>
+// Bitcoin Dev Kit
+// Written in 2020 by Alekos Filini <alekos.filini@gmail.com>
 //
-// Copyright (c) 2020 Magical Bitcoin
+// Copyright (c) 2020-2021 Bitcoin Dev Kit Developers
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
 
 use std::convert::TryInto;
 
@@ -51,7 +38,7 @@ macro_rules! impl_batch_operations {
             Ok(())
         }
 
-        fn set_utxo(&mut self, utxo: &UTXO) -> Result<(), Error> {
+        fn set_utxo(&mut self, utxo: &LocalUtxo) -> Result<(), Error> {
             let key = MapKey::UTXO(Some(&utxo.outpoint)).as_map_key();
             let value = json!({
                 "t": utxo.txout,
@@ -120,7 +107,7 @@ macro_rules! impl_batch_operations {
             }
         }
 
-        fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
+        fn del_utxo(&mut self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error> {
             let key = MapKey::UTXO(Some(outpoint)).as_map_key();
             let res = self.remove(key);
             let res = $process_delete!(res);
@@ -132,7 +119,7 @@ macro_rules! impl_batch_operations {
                     let txout = serde_json::from_value(val["t"].take())?;
                     let keychain = serde_json::from_value(val["i"].take())?;
 
-                    Ok(Some(UTXO { outpoint: outpoint.clone(), txout, keychain }))
+                    Ok(Some(LocalUtxo { outpoint: outpoint.clone(), txout, keychain }))
                 }
             }
         }
@@ -234,7 +221,7 @@ impl Database for Tree {
             .collect()
     }
 
-    fn iter_utxos(&self) -> Result<Vec<UTXO>, Error> {
+    fn iter_utxos(&self) -> Result<Vec<LocalUtxo>, Error> {
         let key = MapKey::UTXO(None).as_map_key();
         self.scan_prefix(key)
             .map(|x| -> Result<_, Error> {
@@ -245,7 +232,7 @@ impl Database for Tree {
                 let txout = serde_json::from_value(val["t"].take())?;
                 let keychain = serde_json::from_value(val["i"].take())?;
 
-                Ok(UTXO {
+                Ok(LocalUtxo {
                     outpoint,
                     txout,
                     keychain,
@@ -305,7 +292,7 @@ impl Database for Tree {
             .transpose()
     }
 
-    fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<UTXO>, Error> {
+    fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<LocalUtxo>, Error> {
         let key = MapKey::UTXO(Some(outpoint)).as_map_key();
         self.get(key)?
             .map(|b| -> Result<_, Error> {
@@ -313,7 +300,7 @@ impl Database for Tree {
                 let txout = serde_json::from_value(val["t"].take())?;
                 let keychain = serde_json::from_value(val["i"].take())?;
 
-                Ok(UTXO {
+                Ok(LocalUtxo {
                     outpoint: *outpoint,
                     txout,
                     keychain,
