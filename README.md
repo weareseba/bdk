@@ -13,7 +13,7 @@
     <a href="https://github.com/bitcoindevkit/bdk/actions?query=workflow%3ACI"><img alt="CI Status" src="https://github.com/bitcoindevkit/bdk/workflows/CI/badge.svg"></a>
     <a href="https://codecov.io/gh/bitcoindevkit/bdk"><img src="https://codecov.io/gh/bitcoindevkit/bdk/branch/master/graph/badge.svg"/></a>
     <a href="https://docs.rs/bdk"><img alt="API Docs" src="https://img.shields.io/badge/docs.rs-bdk-green"/></a>
-    <a href="https://blog.rust-lang.org/2020/07/16/Rust-1.45.0.html"><img alt="Rustc Version 1.45+" src="https://img.shields.io/badge/rustc-1.45%2B-lightgrey.svg"/></a>
+    <a href="https://blog.rust-lang.org/2020/08/27/Rust-1.46.0.html"><img alt="Rustc Version 1.46+" src="https://img.shields.io/badge/rustc-1.46%2B-lightgrey.svg"/></a>
     <a href="https://discord.gg/d7NkDKm"><img alt="Chat on Discord" src="https://img.shields.io/discord/753336465005608961?logo=discord"></a>
   </p>
 
@@ -67,6 +67,7 @@ fn main() -> Result<(), bdk::Error> {
 
 ```rust
 use bdk::{Wallet, database::MemoryDatabase};
+use bdk::wallet::AddressIndex::New;
 
 fn main() -> Result<(), bdk::Error> {
     let wallet = Wallet::new_offline(
@@ -76,9 +77,9 @@ fn main() -> Result<(), bdk::Error> {
         MemoryDatabase::default(),
     )?;
 
-    println!("Address #0: {}", wallet.get_new_address()?);
-    println!("Address #1: {}", wallet.get_new_address()?);
-    println!("Address #2: {}", wallet.get_new_address()?);
+    println!("Address #0: {}", wallet.get_address(New)?);
+    println!("Address #1: {}", wallet.get_address(New)?);
+    println!("Address #2: {}", wallet.get_address(New)?);
 
     Ok(())
 }
@@ -92,6 +93,7 @@ use bdk::database::MemoryDatabase;
 use bdk::blockchain::{noop_progress, ElectrumBlockchain};
 
 use bdk::electrum_client::Client;
+use bdk::wallet::AddressIndex::New;
 
 use bitcoin::consensus::serialize;
 
@@ -107,7 +109,7 @@ fn main() -> Result<(), bdk::Error> {
 
     wallet.sync(noop_progress(), None)?;
 
-    let send_to = wallet.get_new_address()?;
+    let send_to = wallet.get_address(New)?;
     let (psbt, details) = {
         let mut builder = wallet.build_tx();
         builder
