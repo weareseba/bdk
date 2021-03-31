@@ -72,7 +72,7 @@ bdk-testutils-macros = { path = "./testutils-macros"}
 serial_test = "0.4"
 lazy_static = "1.4"
 env_logger = "0.7"
-rstest = "0.6.4"
+rstest = "^0.7"
 tiny-bip39 = "^0.7"
 
 [[example]]
