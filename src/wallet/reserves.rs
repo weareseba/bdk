@@ -32,8 +32,9 @@ use bitcoin::{
     hash_types::{PubkeyHash, Txid},
     util::{
         address::Payload,
-        psbt::{self, Input, PartiallySignedTransaction as PSBT},
+        psbt::{Input, PartiallySignedTransaction as PSBT},
     },
+    Network,
 };
 use bitcoin_hashes::{hash160, sha256d, Hash};
 use bitcoinconsensus;
@@ -101,63 +102,82 @@ where
     }
 
     fn do_verify_proof(&self, psbt: &PSBT, message: &str) -> Result<u64, Error> {
-        let tx = psbt.clone().extract_tx();
-
-        if tx.output.len() != 1 {
-            return Err(Error::ProofOfReservesInvalid(format!(
-                "Wrong number of outputs: {}",
-                tx.output.len()
-            )));
-        }
-        if tx.input.len() <= 1 {
-            return Err(Error::ProofOfReservesInvalid(format!(
-                "Wrong number of inputs: {}",
-                tx.input.len()
-            )));
-        }
-
-        // verify the challenge txin
-        let challenge_txin = challenge_txin(message);
-        if tx.input[0].previous_output != challenge_txin.previous_output {
-            return Err(Error::ProofOfReservesInvalid(
-                "Challenge txin mismatch".to_string(),
-            ));
-        }
-
         // verify the proof UTXOs are still spendable
         // ToDo: verify that the proof inputs were spendable at the block height of the proof
-        let utxos = self.list_unspent()?;
-        if let Some(inp) = tx
-            .input
+        let outpoints = self
+            .list_unspent()?
             .iter()
-            .skip(1)
-            .find(|i| utxos.iter().find(|u| u.outpoint == i.previous_output) == None)
-        {
-            return Err(Error::ProofOfReservesInvalid(format!(
-                "Found an input that is not spendable: {:?}",
-                inp
-            )));
-        }
+            .map(|utxo| utxo.outpoint)
+            .collect();
 
-        // verify that the inputs are signed, except the challenge
-        if let Some(inp) = psbt
-            .inputs
-            .iter()
-            .skip(1)
-            .find(|i| i.partial_sigs.len() == 0)
-        {
-            return Err(Error::ProofOfReservesInvalid(format!(
-                "Found an input that is not signed: {:?}",
-                inp
-            )));
-        }
+        verify_proof(psbt, message, outpoints, self.network)
+    }
+}
 
-        // Verify other inputs against prevouts and calculate the amount.
-        // ToDo: make sure this is enough to verify the signatures
-        let serialized_tx = serialize(&tx);
-        for (idx, utxo) in utxos.into_iter().enumerate() {
+/// Make sure this is a proof, and not a spendable transaction.
+/// Returns the spendable amount of the proof.
+pub fn verify_proof(
+    psbt: &PSBT,
+    message: &str,
+    outpoints: Vec<OutPoint>,
+    network: Network,
+) -> Result<u64, Error> {
+    let tx = &psbt.global.unsigned_tx;
+
+    if tx.output.len() != 1 {
+        return Err(Error::ProofOfReservesInvalid(format!(
+            "Wrong number of outputs: {}",
+            tx.output.len()
+        )));
+    }
+    if tx.input.len() <= 1 {
+        return Err(Error::ProofOfReservesInvalid(format!(
+            "Wrong number of inputs: {}",
+            tx.input.len()
+        )));
+    }
+
+    // verify the challenge txin
+    let challenge_txin = challenge_txin(message);
+    if tx.input[0].previous_output != challenge_txin.previous_output {
+        return Err(Error::ProofOfReservesInvalid(
+            "Challenge txin mismatch".to_string(),
+        ));
+    }
+
+    // verify the proof UTXOs are still spendable
+    // ToDo: verify that the proof inputs were spendable at the block height of the proof
+    if let Some(inp) = tx
+        .input
+        .iter()
+        .skip(1)
+        .find(|i| outpoints.iter().find(|op| **op == i.previous_output) == None)
+    {
+        return Err(Error::ProofOfReservesInvalid(format!(
+            "Found an input that is not spendable: {:?}",
+            inp
+        )));
+    }
+
+    // verify that the inputs are signed, except the challenge
+    if let Some(inp) = psbt
+        .inputs
+        .iter()
+        .skip(1)
+        .find(|i| i.partial_sigs.len() == 0)
+    {
+        return Err(Error::ProofOfReservesInvalid(format!(
+            "Found an input that is not signed: {:?}",
+            inp
+        )));
+    }
+
+    // Verify other inputs against prevouts and calculate the amount.
+    // ToDo: make sure this is enough to verify the signatures
 /*
-            // Verify the script execution of the input.
+    let serialized_tx = serialize(&tx);
+    for (idx, utxo) in utxos.into_iter().enumerate() {
+        // Verify the script execution of the input.
             if let Err(err) = bitcoinconsensus::verify(
                 utxo.txout.script_pubkey.to_bytes().as_slice(),
                 utxo.txout.value,
@@ -166,38 +186,37 @@ where
             ) {
                 return Err(Error::ProofOfReservesInvalid(format!("{:?}", err)));
             }
-*/
-        }
-
-        // calculate the spendable amount of the proof
-        let sum = tx
-            .input
-            .iter()
-            .zip(psbt.inputs.iter())
-            .fold(0, |acc, (tx_in, psbt_in)| {
-                let val = if let Some(utxo) = &psbt_in.witness_utxo {
-                    utxo.value
-                } else if let Some(nwtx) = &psbt_in.non_witness_utxo {
-                    nwtx.output[tx_in.previous_output.vout as usize].value
-                } else {
-                    0
-                };
-                acc + val
-            });
-
-        // verify the unspendable output
-        let pkh = PubkeyHash::from_hash(hash160::Hash::hash(&[0]));
-        let out_script_unspendable = bitcoin::Address {
-            payload: Payload::PubkeyHash(pkh),
-            network: self.network,
-        }
-        .script_pubkey();
-        if tx.output[0].script_pubkey != out_script_unspendable {
-            return Err(Error::ProofOfReservesInvalid("Invalid output".to_string()));
-        }
-
-        Ok(sum)
     }
+*/
+
+    // calculate the spendable amount of the proof
+    let sum = tx
+        .input
+        .iter()
+        .zip(psbt.inputs.iter())
+        .fold(0, |acc, (tx_in, psbt_in)| {
+            let val = if let Some(utxo) = &psbt_in.witness_utxo {
+                utxo.value
+            } else if let Some(nwtx) = &psbt_in.non_witness_utxo {
+                nwtx.output[tx_in.previous_output.vout as usize].value
+            } else {
+                0
+            };
+            acc + val
+        });
+
+    // verify the unspendable output
+    let pkh = PubkeyHash::from_hash(hash160::Hash::hash(&[0]));
+    let out_script_unspendable = bitcoin::Address {
+        payload: Payload::PubkeyHash(pkh),
+        network: network,
+    }
+    .script_pubkey();
+    if tx.output[0].script_pubkey != out_script_unspendable {
+        return Err(Error::ProofOfReservesInvalid("Invalid output".to_string()));
+    }
+
+    Ok(sum)
 }
 
 /// Construct a challenge input with the message
@@ -215,7 +234,7 @@ fn challenge_txin(message: &str) -> TxIn {
 #[cfg(test)]
 mod test {
     use bitcoin::{
-//        blockdata::transaction::Transaction,
+        blockdata::transaction::Transaction,
         consensus::Encodable,
         secp256k1::Secp256k1,
         util::key::{PrivateKey, PublicKey},
@@ -225,16 +244,15 @@ mod test {
     use std::{
         fs::{self, File},
         io::Write,
-//        str::FromStr,
+        str::FromStr,
     };
 
     use super::*;
     use crate::blockchain::{noop_progress, ElectrumBlockchain};
     use crate::database::memory::MemoryDatabase;
     use crate::electrum_client::Client;
-//    use crate::types::{KeychainKind, LocalUtxo, TransactionDetails};
+    use crate::types::{KeychainKind, LocalUtxo, TransactionDetails};
 
-/*
     pub(crate) fn get_funded_wallet(
         descriptor: &str,
         network: Network,
@@ -244,13 +262,8 @@ mod test {
         bitcoin::Txid,
     ) {
         let descriptors = testutils!(@descriptors (descriptor));
-        let wallet = Wallet::new_offline(
-            &descriptors.0,
-            None,
-            network,
-            MemoryDatabase::new(),
-        )
-        .unwrap();
+        let wallet =
+            Wallet::new_offline(&descriptors.0, None, network, MemoryDatabase::new()).unwrap();
 
         let txid = crate::populate_test_db!(
             wallet.database.borrow_mut(),
@@ -295,8 +308,6 @@ mod test {
 
         Ok(())
     }
-*/
-*/
 
     enum MultisigType {
         Wsh,
