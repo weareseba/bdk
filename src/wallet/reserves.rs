@@ -22,6 +22,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+//! Proof of reserves
+//!
+//! This module provides the ability to create proofs of reserves.
+//! A proof is a valid but unspendable transaction. By signing a transaction
+//! that spends some UTXOs we are prooving that we have control over these funds.
+
 use bitcoin::{
     blockdata::{
         opcodes,
@@ -38,6 +44,7 @@ use bitcoin::{
 };
 use bitcoin_hashes::{hash160, sha256d, Hash};
 use bitcoinconsensus;
+use std::convert::TryInto;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -160,50 +167,82 @@ pub fn verify_proof(
     }
 
     // verify that the inputs are signed, except the challenge
-    if let Some(inp) = psbt
+    if let Some((i, inp)) = psbt
         .inputs
         .iter()
+        .enumerate()
         .skip(1)
-        .find(|i| i.partial_sigs.len() == 0)
+        .find(|(_i, inp)| inp.partial_sigs.len() == 0)
     {
         return Err(Error::ProofOfReservesInvalid(format!(
-            "Found an input that is not signed: {:?}",
-            inp
+            "Found an input that is not signed at #{} : {:?}",
+            i, inp
         )));
     }
 
     // Verify other inputs against prevouts and calculate the amount.
     // ToDo: make sure this is enough to verify the signatures
-/*
     let serialized_tx = serialize(&tx);
-    for (idx, utxo) in utxos.into_iter().enumerate() {
-        // Verify the script execution of the input.
-            if let Err(err) = bitcoinconsensus::verify(
-                utxo.txout.script_pubkey.to_bytes().as_slice(),
-                utxo.txout.value,
-                &serialized_tx,
-                idx + 1, // skipped the challenge input
-            ) {
-                return Err(Error::ProofOfReservesInvalid(format!("{:?}", err)));
+    if let Some((i, res)) = psbt
+        .inputs
+        .iter()
+        .zip(tx.input.iter())
+        .enumerate()
+        .map(|(i, (psbt_in, tx_in))| {
+            if let Some(utxo) = &psbt_in.witness_utxo {
+                (
+                    i,
+                    &utxo.script_pubkey,
+                    utxo.value,
+                    tx_in.previous_output.vout,
+                )
+            } else if let Some(nwtx) = &psbt_in.non_witness_utxo {
+                let outp = &nwtx.output[tx_in.previous_output.vout as usize];
+                (
+                    i,
+                    &outp.script_pubkey,
+                    outp.value,
+                    tx_in.previous_output.vout,
+                )
+            } else {
+                panic!("must be either witness or legacy");
             }
+        })
+        .map(|(i, script, value, vout)| {
+            (
+                i,
+                bitcoinconsensus::verify(
+                    script.to_bytes().as_slice(),
+                    value,
+                    &serialized_tx,
+                    vout.try_into().unwrap(),
+                ),
+            )
+        })
+        .find(|(_i, res)| res.is_err())
+    {
+        return Err(Error::ProofOfReservesInvalid(format!(
+            "Signature validation error at input #{}: {:?}",
+            i,
+            res.err().unwrap()
+        )));
     }
-*/
 
     // calculate the spendable amount of the proof
     let sum = tx
         .input
         .iter()
         .zip(psbt.inputs.iter())
-        .fold(0, |acc, (tx_in, psbt_in)| {
-            let val = if let Some(utxo) = &psbt_in.witness_utxo {
+        .map(|(tx_in, psbt_in)| {
+            if let Some(utxo) = &psbt_in.witness_utxo {
                 utxo.value
             } else if let Some(nwtx) = &psbt_in.non_witness_utxo {
                 nwtx.output[tx_in.previous_output.vout as usize].value
             } else {
                 0
-            };
-            acc + val
-        });
+            }
+        })
+        .fold(0, |acc, val| acc + val);
 
     // verify the unspendable output
     let pkh = PubkeyHash::from_hash(hash160::Hash::hash(&[0]));
@@ -235,9 +274,10 @@ fn challenge_txin(message: &str) -> TxIn {
 mod test {
     use bitcoin::{
         blockdata::transaction::Transaction,
-        consensus::Encodable,
+        consensus::{encode::Decodable, Encodable},
         secp256k1::Secp256k1,
         util::key::{PrivateKey, PublicKey},
+        util::psbt::PartiallySignedTransaction,
         Network,
     };
     use rstest::rstest;
@@ -250,8 +290,46 @@ mod test {
     use super::*;
     use crate::blockchain::{noop_progress, ElectrumBlockchain};
     use crate::database::memory::MemoryDatabase;
-    use crate::electrum_client::Client;
+    use crate::electrum_client::{Client, ElectrumApi};
     use crate::types::{KeychainKind, LocalUtxo, TransactionDetails};
+
+    #[test]
+    fn verify_proof_testnet() {
+        let psbt = r#"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"#;
+        let psbt = base64::decode(psbt).unwrap();
+        let psbt = PartiallySignedTransaction::consensus_decode(&psbt[..]).unwrap();
+        let message = "SEBA Cold Storage 2021-04-01";
+        let network = Network::Testnet;
+        let address = bitcoin::Address::from_str("2Mtkk3kjyN8hgdGXPuJCNnwS3BBY4K2frhY").unwrap();
+
+        let client = Client::new("ssl://electrum.blockstream.info:60002").unwrap();
+        let balance = client.script_get_balance(&address.script_pubkey()).unwrap();
+
+        // redundant detailed verification start
+        let tx = &psbt.global.unsigned_tx;
+
+        assert_eq!(tx.input.len(), 3);
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(psbt.inputs[0].partial_sigs.len(), 3);
+        assert_eq!(psbt.inputs[1].partial_sigs.len(), 0);
+        assert_eq!(psbt.inputs[2].partial_sigs.len(), 0);
+
+        // redundant detailed verification end
+
+        let unspents = client
+            .script_list_unspent(&address.script_pubkey())
+            .unwrap();
+        let outpoints: Vec<_> = unspents
+            .iter()
+            .map(|utxo| OutPoint {
+                txid: utxo.tx_hash,
+                vout: utxo.tx_pos as u32,
+            })
+            .collect();
+
+        let spendable = verify_proof(&psbt, message, outpoints, network).unwrap();
+        assert_eq!(spendable, balance.confirmed + balance.unconfirmed as u64);
+    }
 
     pub(crate) fn get_funded_wallet(
         descriptor: &str,
@@ -413,20 +491,24 @@ mod test {
                 .fold(0, |acc, i| acc + i.partial_sigs.len())
         };
 
-        let (psbt, _finalized) = wallet1.sign(psbt, None)?;
+        let (psbt, finalized) = wallet1.sign(psbt, None)?;
         assert_eq!(count_signatures(&psbt), (num_inp - 0) * 1);
+        assert_eq!(finalized, false);
 
-        let (psbt, _finalized) = wallet2.sign(psbt, None)?;
+        let (psbt, finalized) = wallet2.sign(psbt, None)?;
         assert_eq!(count_signatures(&psbt), (num_inp - 0) * 2);
+        assert_eq!(finalized, false);
 
-        let (psbt, _finalized) = wallet3.sign(psbt, None)?;
+        let (psbt, finalized) = wallet3.sign(psbt, None)?;
         assert_eq!(count_signatures(&psbt), (num_inp - 0) * 3);
+        assert_eq!(finalized, false);
 
         let (psbt, finalized) = wallet1.finalize_psbt(psbt, None)?;
         assert_eq!(count_signatures(&psbt), (num_inp - 0) * 3);
         if !finalized {
             write_to_temp_file(&psbt);
         }
+        assert_eq!(finalized, false);
 
         let spendable = wallet1.verify_proof(&psbt, &message)?;
         assert_eq!(spendable, balance);
