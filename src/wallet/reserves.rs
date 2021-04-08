@@ -292,9 +292,10 @@ mod test {
     use crate::database::memory::MemoryDatabase;
     use crate::electrum_client::{Client, ElectrumApi};
     use crate::types::{KeychainKind, LocalUtxo, TransactionDetails};
+    use crate::wallet::test::get_funded_wallet;
 
     #[test]
-    fn verify_proof_testnet() {
+    fn verify_existing_proof_testnet() {
         let psbt = r#"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"#;
         let psbt = base64::decode(psbt).unwrap();
         let psbt = PartiallySignedTransaction::consensus_decode(&psbt[..]).unwrap();
@@ -331,29 +332,6 @@ mod test {
         assert_eq!(spendable, balance.confirmed + balance.unconfirmed as u64);
     }
 
-    pub(crate) fn get_funded_wallet(
-        descriptor: &str,
-        network: Network,
-    ) -> (
-        Wallet<(), MemoryDatabase>,
-        (String, Option<String>),
-        bitcoin::Txid,
-    ) {
-        let descriptors = testutils!(@descriptors (descriptor));
-        let wallet =
-            Wallet::new_offline(&descriptors.0, None, network, MemoryDatabase::new()).unwrap();
-
-        let txid = crate::populate_test_db!(
-            wallet.database.borrow_mut(),
-            testutils! {
-                @tx ( (@external descriptors, 0) => 50_000 ) (@confirmations 1)
-            },
-            Some(100)
-        );
-
-        (wallet, descriptors, txid)
-    }
-
     #[rstest(
         descriptor,
 //        case("wpkh(xprv9s21ZrQH143K4CTb63EaMxja1YiTnSEWKMbn23uoEnAzxjdUJRQkazCAtzxGm4LSoTSVTptoV9RbchnKPW9HxKtZumdyxyikZFDLhogJ5Uj/44'/0'/0'/0/*)"),
@@ -362,7 +340,7 @@ mod test {
         case("wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(100000)))") // and(pk(Alice),after(100000))
     )]
     fn test_proof(descriptor: &'static str) -> Result<(), Error> {
-        let (wallet, _, _) = get_funded_wallet(descriptor, Network::Bitcoin);
+        let (wallet, _, _) = get_funded_wallet(descriptor);
         let balance = wallet.get_balance()?;
 
         let message = "This belongs to me.";
