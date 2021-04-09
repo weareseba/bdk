@@ -26,7 +26,10 @@
 //!
 //! This module provides the ability to create proofs of reserves.
 //! A proof is a valid but unspendable transaction. By signing a transaction
-//! that spends some UTXOs we are prooving that we have control over these funds.
+//! that spends some UTXOs we are proofing that we have control over these funds.
+//! The implementation is inspired by the following BIPs:
+//! https://github.com/bitcoin/bips/blob/master/bip-0127.mediawiki
+//! https://github.com/bitcoin/bips/blob/master/bip-0322.mediawiki
 
 use bitcoin::{
     blockdata::{
@@ -54,8 +57,6 @@ use crate::error::Error;
 use crate::wallet::Wallet;
 
 /// The API for proof of reserves
-/// https://github.com/bitcoin/bips/blob/master/bip-0127.mediawiki
-/// https://github.com/bitcoin/bips/blob/master/bip-0322.mediawiki
 pub trait ProofOfReserves {
     /// Create a proof for all spendable UTXOs in a wallet
     fn create_proof(&self, message: &str) -> Result<PSBT, Error> {
@@ -75,7 +76,6 @@ pub trait ProofOfReserves {
 
 impl<B, D> ProofOfReserves for Wallet<B, D>
 where
-    //    B: BlockchainMarker,
     D: BatchDatabase,
 {
     fn do_create_proof(&self, message: &str) -> Result<PSBT, Error> {
@@ -273,7 +273,6 @@ fn challenge_txin(message: &str) -> TxIn {
 #[cfg(test)]
 mod test {
     use bitcoin::{
-        blockdata::transaction::Transaction,
         consensus::{encode::Decodable, Encodable},
         secp256k1::Secp256k1,
         util::key::{PrivateKey, PublicKey},
@@ -291,7 +290,6 @@ mod test {
     use crate::blockchain::{noop_progress, ElectrumBlockchain};
     use crate::database::memory::MemoryDatabase;
     use crate::electrum_client::{Client, ElectrumApi};
-    use crate::types::{KeychainKind, LocalUtxo, TransactionDetails};
     use crate::wallet::test::get_funded_wallet;
 
     #[test]
@@ -497,6 +495,7 @@ mod test {
     fn write_to_temp_file(psbt: &PSBT) {
         let data = encode_tx(psbt).unwrap();
         let filename = "/tmp/psbt";
+        #[allow(unused_must_use)]
         fs::remove_file(filename);
         let mut file = File::create(&filename).unwrap();
         file.write_all(&data).unwrap();
