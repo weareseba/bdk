@@ -43,7 +43,7 @@
 //! interact with the bitcoin P2P network.
 //!
 //! ```toml
-//! bdk = "0.5.0"
+//! bdk = "0.6.0"
 //! ```
 //!
 //! ## Sync the balance of a descriptor
@@ -251,7 +251,7 @@ pub(crate) mod types;
 pub mod wallet;
 
 pub use descriptor::template;
-pub use descriptor::HDKeyPaths;
+pub use descriptor::HdKeyPaths;
 pub use error::Error;
 pub use types::*;
 pub use wallet::address_validator;
