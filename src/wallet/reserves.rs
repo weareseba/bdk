@@ -102,6 +102,7 @@ where
             .drain_wallet()
             .add_foreign_utxo(challenge_txin.previous_output, challenge_psbt_inp, 42)?
             .fee_absolute(0)
+            .only_witness_utxo()
             .set_single_recipient(out_script_unspendable);
         let (psbt, _details) = builder.finish().unwrap();
 
