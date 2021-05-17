@@ -291,6 +291,7 @@ mod test {
     use crate::database::memory::MemoryDatabase;
     use crate::electrum_client::{Client, ElectrumApi};
     use crate::wallet::test::get_funded_wallet;
+    use crate::SignOptions;
 
     #[test]
     fn verify_existing_proof_testnet() {
@@ -342,7 +343,7 @@ mod test {
         let balance = wallet.get_balance()?;
 
         let message = "This belongs to me.";
-        let psbt = wallet.create_proof(&message)?;
+        let mut psbt = wallet.create_proof(&message)?;
         let num_inp = psbt.inputs.len();
         assert!(
             num_inp > 1,
@@ -350,14 +351,20 @@ mod test {
             num_inp
         );
 
-        let (signed_psbt, _finalized) = wallet.sign(psbt, None)?;
-        let num_sigs = signed_psbt
+        let _finalized = wallet.sign(
+            &mut psbt,
+            SignOptions {
+                trust_witness_utxo: true,
+                ..Default::default()
+            },
+        )?;
+        let num_sigs = psbt
             .inputs
             .iter()
             .fold(0, |acc, i| acc + i.partial_sigs.len());
         assert_eq!(num_sigs, (num_inp - 0) * 1);
 
-        let spendable = wallet.verify_proof(&signed_psbt, &message)?;
+        let spendable = wallet.verify_proof(&psbt, &message)?;
         assert_eq!(spendable, balance);
 
         Ok(())
@@ -453,7 +460,7 @@ mod test {
         );
 
         let message = "All my precious coins";
-        let psbt = wallet1.create_proof(message)?;
+        let mut psbt = wallet1.create_proof(message)?;
         let num_inp = psbt.inputs.len();
         assert!(
             num_inp > 1,
@@ -467,19 +474,23 @@ mod test {
                 .fold(0, |acc, i| acc + i.partial_sigs.len())
         };
 
-        let (psbt, finalized) = wallet1.sign(psbt, None)?;
+        let signopts = SignOptions {
+            trust_witness_utxo: true,
+            ..Default::default()
+        };
+        let finalized = wallet1.sign(&mut psbt, signopts.clone())?;
         assert_eq!(count_signatures(&psbt), (num_inp - 0) * 1);
         assert_eq!(finalized, false);
 
-        let (psbt, finalized) = wallet2.sign(psbt, None)?;
+        let finalized = wallet2.sign(&mut psbt, signopts.clone())?;
         assert_eq!(count_signatures(&psbt), (num_inp - 0) * 2);
         assert_eq!(finalized, false);
 
-        let (psbt, finalized) = wallet3.sign(psbt, None)?;
+        let finalized = wallet3.sign(&mut psbt, signopts.clone())?;
         assert_eq!(count_signatures(&psbt), (num_inp - 0) * 3);
         assert_eq!(finalized, false);
 
-        let (psbt, finalized) = wallet1.finalize_psbt(psbt, None)?;
+        let finalized = wallet1.finalize_psbt(&mut psbt, signopts)?;
         assert_eq!(count_signatures(&psbt), (num_inp - 0) * 3);
         if !finalized {
             write_to_temp_file(&psbt);
