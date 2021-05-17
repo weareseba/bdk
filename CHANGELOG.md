@@ -6,12 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.7.0] - [v0.6.0]
+
 ### Policy
 #### Changed
 Removed `fill_satisfaction` method in favor of enum parameter in `extract_policy` method
 
 #### Added
 Timelocks are considered (optionally) in building the `satisfaction` field
+
+### Wallet
+
+- Changed `Wallet::{sign, finalize_psbt}` now take a `&mut psbt` rather than consuming it.
+- Require and validate `non_witness_utxo` for SegWit signatures by default, can be adjusted with `SignOptions`
+- Replace the opt-in builder option `force_non_witness_utxo` with the opposite `only_witness_utxo`. From now on we will provide the `non_witness_utxo`, unless explicitly asked not to.
 
 ## [v0.6.0] - [v0.5.1]
 
@@ -332,3 +340,4 @@ final transaction is created by calling `finish` on the builder.
 [v0.5.0]: https://github.com/bitcoindevkit/bdk/compare/v0.4.0...v0.5.0
 [v0.5.1]: https://github.com/bitcoindevkit/bdk/compare/v0.5.0...v0.5.1
 [v0.6.0]: https://github.com/bitcoindevkit/bdk/compare/v0.5.1...v0.6.0
+[v0.7.0]: https://github.com/bitcoindevkit/bdk/compare/v0.6.0...v0.7.0

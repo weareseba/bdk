@@ -1,6 +1,6 @@
 [package]
 name = "bdk"
-version = "0.6.1-dev"
+version = "0.7.1-dev"
 edition = "2018"
 authors = ["Alekos Filini <alekos.filini@gmail.com>", "Riccardo Casatta <riccardo@casatta.it>"]
 homepage = "https://bitcoindevkit.org"
@@ -70,7 +70,7 @@ test-md-docs = ["electrum"]
 
 [dev-dependencies]
 bdk-testutils = "0.4"
-bdk-testutils-macros = "0.5"
+bdk-testutils-macros = "0.6"
 serial_test = "0.4"
 lazy_static = "1.4"
 env_logger = "0.7"

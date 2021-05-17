@@ -206,6 +206,12 @@ impl Signer for DescriptorXKey<ExtendedPrivKey> {
             return Err(SignerError::InputIndexOutOfRange);
         }
 
+        if psbt.inputs[input_index].final_script_sig.is_some()
+            || psbt.inputs[input_index].final_script_witness.is_some()
+        {
+            return Ok(());
+        }
+
         let (public_key, full_path) = match psbt.inputs[input_index]
             .bip32_derivation
             .iter()
@@ -261,8 +267,14 @@ impl Signer for PrivateKey {
         secp: &SecpCtx,
     ) -> Result<(), SignerError> {
         let input_index = input_index.unwrap();
-        if input_index >= psbt.inputs.len() {
+        if input_index >= psbt.inputs.len() || input_index >= psbt.global.unsigned_tx.input.len() {
             return Err(SignerError::InputIndexOutOfRange);
+        }
+
+        if psbt.inputs[input_index].final_script_sig.is_some()
+            || psbt.inputs[input_index].final_script_witness.is_some()
+        {
+            return Ok(());
         }
 
         let pubkey = self.public_key(&secp);
@@ -427,6 +439,43 @@ impl SignersContainer {
     }
 }
 
+/// Options for a software signer
+///
+/// Adjust the behavior of our software signers and the way a transaction is finalized
+#[derive(Debug, Clone)]
+pub struct SignOptions {
+    /// Whether the signer should trust the `witness_utxo`, if the `non_witness_utxo` hasn't been
+    /// provided
+    ///
+    /// Defaults to `false` to mitigate the "SegWit bug" which chould trick the wallet into
+    /// paying a fee larger than expected.
+    ///
+    /// Some wallets, especially if relatively old, might not provide the `non_witness_utxo` for
+    /// SegWit transactions in the PSBT they generate: in those cases setting this to `true`
+    /// should correctly produce a signature, at the expense of an increased trust in the creator
+    /// of the PSBT.
+    ///
+    /// For more details see: <https://blog.trezor.io/details-of-firmware-updates-for-trezor-one-version-1-9-1-and-trezor-model-t-version-2-3-1-1eba8f60f2dd>
+    pub trust_witness_utxo: bool,
+
+    /// Whether the wallet should assume a specific height has been reached when trying to finalize
+    /// a transaction
+    ///
+    /// The wallet will only "use" a timelock to satisfy the spending policy of an input if the
+    /// timelock height has already been reached. This option allows overriding the "current height" to let the
+    /// wallet use timelocks in the future to spend a coin.
+    pub assume_height: Option<u32>,
+}
+
+impl Default for SignOptions {
+    fn default() -> Self {
+        SignOptions {
+            trust_witness_utxo: false,
+            assume_height: None,
+        }
+    }
+}
+
 pub(crate) trait ComputeSighash {
     fn sighash(
         psbt: &psbt::PartiallySignedTransaction,
@@ -439,7 +488,7 @@ impl ComputeSighash for Legacy {
         psbt: &psbt::PartiallySignedTransaction,
         input_index: usize,
     ) -> Result<(SigHash, SigHashType), SignerError> {
-        if input_index >= psbt.inputs.len() {
+        if input_index >= psbt.inputs.len() || input_index >= psbt.global.unsigned_tx.input.len() {
             return Err(SignerError::InputIndexOutOfRange);
         }
 
@@ -487,25 +536,42 @@ impl ComputeSighash for Segwitv0 {
         psbt: &psbt::PartiallySignedTransaction,
         input_index: usize,
     ) -> Result<(SigHash, SigHashType), SignerError> {
-        if input_index >= psbt.inputs.len() {
+        if input_index >= psbt.inputs.len() || input_index >= psbt.global.unsigned_tx.input.len() {
             return Err(SignerError::InputIndexOutOfRange);
         }
 
         let psbt_input = &psbt.inputs[input_index];
+        let tx_input = &psbt.global.unsigned_tx.input[input_index];
 
         let sighash = psbt_input.sighash_type.unwrap_or(SigHashType::All);
 
-        let witness_utxo = psbt_input
-            .witness_utxo
-            .as_ref()
-            .ok_or(SignerError::MissingNonWitnessUtxo)?;
-        let value = witness_utxo.value;
+        // Always try first with the non-witness utxo
+        let utxo = if let Some(prev_tx) = &psbt_input.non_witness_utxo {
+            // Check the provided prev-tx
+            if prev_tx.txid() != tx_input.previous_output.txid {
+                return Err(SignerError::InvalidNonWitnessUtxo);
+            }
+
+            // The output should be present, if it's missing the `non_witness_utxo` is invalid
+            prev_tx
+                .output
+                .get(tx_input.previous_output.vout as usize)
+                .ok_or(SignerError::InvalidNonWitnessUtxo)?
+        } else if let Some(witness_utxo) = &psbt_input.witness_utxo {
+            // Fallback to the witness_utxo. If we aren't allowed to use it, signing should fail
+            // before we get to this point
+            witness_utxo
+        } else {
+            // Nothing has been provided
+            return Err(SignerError::MissingNonWitnessUtxo);
+        };
+        let value = utxo.value;
 
         let script = match psbt_input.witness_script {
             Some(ref witness_script) => witness_script.clone(),
             None => {
-                if witness_utxo.script_pubkey.is_v0_p2wpkh() {
-                    p2wpkh_script_code(&witness_utxo.script_pubkey)
+                if utxo.script_pubkey.is_v0_p2wpkh() {
+                    p2wpkh_script_code(&utxo.script_pubkey)
                 } else if psbt_input
                     .redeem_script
                     .as_ref()

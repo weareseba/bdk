@@ -130,7 +130,7 @@ fn main() -> Result<(), bdk::Error> {
 ### Sign a transaction
 
 ```rust,no_run
-use bdk::{Wallet, database::MemoryDatabase};
+use bdk::{Wallet, SignOptions, database::MemoryDatabase};
 
 use bitcoin::consensus::deserialize;
 
@@ -143,9 +143,9 @@ fn main() -> Result<(), bdk::Error> {
     )?;
 
     let psbt = "...";
-    let psbt = deserialize(&base64::decode(psbt).unwrap())?;
+    let mut psbt = deserialize(&base64::decode(psbt).unwrap())?;
 
-    let (signed_psbt, finalized) = wallet.sign(psbt, None)?;
+    let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
 
     Ok(())
 }

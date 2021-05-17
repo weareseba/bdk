@@ -23,9 +23,9 @@ use bitcoin::secp256k1::Secp256k1;
 
 use bitcoin::consensus::encode::serialize;
 use bitcoin::util::base58;
-use bitcoin::util::psbt::raw::Key as PSBTKey;
+use bitcoin::util::psbt::raw::Key as PsbtKey;
 use bitcoin::util::psbt::Input;
-use bitcoin::util::psbt::PartiallySignedTransaction as PSBT;
+use bitcoin::util::psbt::PartiallySignedTransaction as Psbt;
 use bitcoin::{Address, Network, OutPoint, Script, SigHashType, Transaction, TxOut, Txid};
 
 use miniscript::descriptor::DescriptorTrait;
@@ -47,7 +47,7 @@ pub use utils::IsDust;
 
 use address_validator::AddressValidator;
 use coin_selection::DefaultCoinSelectionAlgorithm;
-use signer::{Signer, SignerOrdering, SignersContainer};
+use signer::{SignOptions, Signer, SignerOrdering, SignersContainer};
 use tx_builder::{BumpFee, CreateTx, FeePolicy, TxBuilder, TxParams};
 use utils::{check_nlocktime, check_nsequence_rbf, After, Older, SecpCtx, DUST_LIMIT_SATOSHI};
 
@@ -62,6 +62,7 @@ use crate::descriptor::{
 };
 use crate::error::Error;
 use crate::psbt::PsbtUtils;
+use crate::signer::SignerError;
 use crate::types::*;
 
 const CACHE_ADDR_BATCH_SIZE: u32 = 100;
@@ -371,7 +372,7 @@ where
         &self,
         coin_selection: Cs,
         params: TxParams,
-    ) -> Result<(PSBT, TransactionDetails), Error> {
+    ) -> Result<(Psbt, TransactionDetails), Error> {
         let external_policy = self
             .descriptor
             .extract_policy(&self.signers, BuildSatisfaction::None, &self.secp)?
@@ -700,24 +701,24 @@ where
     /// # let descriptor = "wpkh(tpubD6NzVbkrYhZ4Xferm7Pz4VnjdcDPFyjVu5K4iZXQ4pVN8Cks4pHVowTBXBKRhX64pkRyJZJN5xAKj4UDNnLPb5p2sSKXhewoYx5GbTdUFWq/*)";
     /// # let wallet = doctest_wallet!();
     /// # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap();
-    /// let (psbt, _) = {
+    /// let (mut psbt, _) = {
     ///     let mut builder = wallet.build_tx();
     ///     builder
     ///         .add_recipient(to_address.script_pubkey(), 50_000)
     ///         .enable_rbf();
     ///     builder.finish()?
     /// };
-    /// let (psbt, _) = wallet.sign(psbt, None)?;
+    /// let _ = wallet.sign(&mut psbt, SignOptions::default())?;
     /// let tx = psbt.extract_tx();
     /// // broadcast tx but it's taking too long to confirm so we want to bump the fee
-    /// let (psbt, _) =  {
+    /// let (mut psbt, _) =  {
     ///     let mut builder = wallet.build_fee_bump(tx.txid())?;
     ///     builder
     ///         .fee_rate(FeeRate::from_sat_per_vb(5.0));
     ///     builder.finish()?
     /// };
     ///
-    /// let (psbt, _) = wallet.sign(psbt, None)?;
+    /// let _ = wallet.sign(&mut psbt, SignOptions::default())?;
     /// let fee_bumped_tx = psbt.extract_tx();
     /// // broadcast fee_bumped_tx to replace original
     /// # Ok::<(), bdk::Error>(())
@@ -834,6 +835,11 @@ where
     /// Sign a transaction with all the wallet's signers, in the order specified by every signer's
     /// [`SignerOrdering`]
     ///
+    /// The [`SignOptions`] can be used to tweak the behavior of the software signers, and the way
+    /// the transaction is finalized at the end. Note that it can't be guaranteed that *every*
+    /// signers will follow the options, but the "software signers" (WIF keys and `xprv`) defined
+    /// in this library will.
+    ///
     /// ## Example
     ///
     /// ```
@@ -844,17 +850,29 @@ where
     /// # let descriptor = "wpkh(tpubD6NzVbkrYhZ4Xferm7Pz4VnjdcDPFyjVu5K4iZXQ4pVN8Cks4pHVowTBXBKRhX64pkRyJZJN5xAKj4UDNnLPb5p2sSKXhewoYx5GbTdUFWq/*)";
     /// # let wallet = doctest_wallet!();
     /// # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap();
-    /// let (psbt, _) = {
+    /// let (mut psbt, _) = {
     ///     let mut builder = wallet.build_tx();
     ///     builder.add_recipient(to_address.script_pubkey(), 50_000);
     ///     builder.finish()?
     /// };
-    /// let (signed_psbt, finalized) = wallet.sign(psbt, None)?;
+    /// let  finalized = wallet.sign(&mut psbt, SignOptions::default())?;
     /// assert!(finalized, "we should have signed all the inputs");
     /// # Ok::<(), bdk::Error>(())
-    pub fn sign(&self, mut psbt: PSBT, assume_height: Option<u32>) -> Result<(PSBT, bool), Error> {
+    pub fn sign(&self, psbt: &mut Psbt, sign_options: SignOptions) -> Result<bool, Error> {
         // this helps us doing our job later
-        self.add_input_hd_keypaths(&mut psbt)?;
+        self.add_input_hd_keypaths(psbt)?;
+
+        // If we aren't allowed to use `witness_utxo`, ensure that every input but finalized one
+        // has the `non_witness_utxo`
+        if !sign_options.trust_witness_utxo
+            && psbt
+                .inputs
+                .iter()
+                .filter(|i| i.final_script_witness.is_none() && i.final_script_sig.is_none())
+                .any(|i| i.non_witness_utxo.is_none())
+        {
+            return Err(Error::Signer(signer::SignerError::MissingNonWitnessUtxo));
+        }
 
         for signer in self
             .signers
@@ -863,16 +881,16 @@ where
             .chain(self.change_signers.signers().iter())
         {
             if signer.sign_whole_tx() {
-                signer.sign(&mut psbt, None, &self.secp)?;
+                signer.sign(psbt, None, &self.secp)?;
             } else {
                 for index in 0..psbt.inputs.len() {
-                    signer.sign(&mut psbt, Some(index), &self.secp)?;
+                    signer.sign(psbt, Some(index), &self.secp)?;
                 }
             }
         }
 
         // attempt to finalize
-        self.finalize_psbt(psbt, assume_height)
+        self.finalize_psbt(psbt, sign_options)
     }
 
     /// Return the spending policies for the wallet's descriptor
@@ -908,16 +926,17 @@ where
     }
 
     /// Try to finalize a PSBT
-    pub fn finalize_psbt(
-        &self,
-        mut psbt: PSBT,
-        assume_height: Option<u32>,
-    ) -> Result<(PSBT, bool), Error> {
+    ///
+    /// The [`SignOptions`] can be used to tweak the behavior of the finalizer.
+    pub fn finalize_psbt(&self, psbt: &mut Psbt, sign_options: SignOptions) -> Result<bool, Error> {
         let tx = &psbt.global.unsigned_tx;
         let mut finished = true;
 
         for (n, input) in tx.input.iter().enumerate() {
-            let psbt_input = &psbt.inputs[n];
+            let psbt_input = &psbt
+                .inputs
+                .get(n)
+                .ok_or(Error::Signer(SignerError::InputIndexOutOfRange))?;
             if psbt_input.final_script_sig.is_some() || psbt_input.final_script_witness.is_some() {
                 continue;
             }
@@ -928,7 +947,7 @@ where
                 .borrow()
                 .get_tx(&input.previous_output.txid, false)?
                 .map(|tx| tx.height.unwrap_or(std::u32::MAX));
-            let current_height = assume_height.or(self.current_height);
+            let current_height = sign_options.assume_height.or(self.current_height);
 
             debug!(
                 "Input #{} - {}, using `create_height` = {:?}, `current_height` = {:?}",
@@ -985,7 +1004,7 @@ where
             }
         }
 
-        Ok((psbt, finished))
+        Ok(finished)
     }
 
     /// Return the secp256k1 context used for all signing operations
@@ -1210,10 +1229,10 @@ where
         tx: Transaction,
         selected: Vec<Utxo>,
         params: TxParams,
-    ) -> Result<PSBT, Error> {
+    ) -> Result<Psbt, Error> {
         use bitcoin::util::psbt::serialize::Serialize;
 
-        let mut psbt = PSBT::from_unsigned_tx(tx)?;
+        let mut psbt = Psbt::from_unsigned_tx(tx)?;
 
         if params.add_global_xpubs {
             let mut all_xpubs = self.descriptor.get_extended_keys()?;
@@ -1224,7 +1243,7 @@ where
             for xpub in all_xpubs {
                 let serialized_xpub = base58::from_check(&xpub.xkey.to_string())
                     .expect("Internal serialization error");
-                let key = PSBTKey {
+                let key = PsbtKey {
                     type_value: 0x01,
                     key: serialized_xpub,
                 };
@@ -1259,28 +1278,23 @@ where
 
             match utxo {
                 Utxo::Local(utxo) => {
-                    *psbt_input = match self.get_psbt_input(
-                        utxo,
-                        params.sighash,
-                        params.force_non_witness_utxo,
-                    ) {
-                        Ok(psbt_input) => psbt_input,
-                        Err(e) => match e {
-                            Error::UnknownUtxo => Input {
-                                sighash_type: params.sighash,
-                                ..Input::default()
+                    *psbt_input =
+                        match self.get_psbt_input(utxo, params.sighash, params.only_witness_utxo) {
+                            Ok(psbt_input) => psbt_input,
+                            Err(e) => match e {
+                                Error::UnknownUtxo => Input {
+                                    sighash_type: params.sighash,
+                                    ..Input::default()
+                                },
+                                _ => return Err(e),
                             },
-                            _ => return Err(e),
-                        },
-                    }
+                        }
                 }
                 Utxo::Foreign {
                     psbt_input: foreign_psbt_input,
                     outpoint,
                 } => {
-                    if params.force_non_witness_utxo
-                        && foreign_psbt_input.non_witness_utxo.is_none()
-                    {
+                    if !params.only_witness_utxo && foreign_psbt_input.non_witness_utxo.is_none() {
                         return Err(Error::Generic(format!(
                             "Missing non_witness_utxo on foreign utxo {}",
                             outpoint
@@ -1324,7 +1338,7 @@ where
         &self,
         utxo: LocalUtxo,
         sighash_type: Option<SigHashType>,
-        force_non_witness_utxo: bool,
+        only_witness_utxo: bool,
     ) -> Result<Input, Error> {
         // Try to find the prev_script in our db to figure out if this is internal or external,
         // and the derivation index
@@ -1351,14 +1365,14 @@ where
             if desc.is_witness() {
                 psbt_input.witness_utxo = Some(prev_tx.output[prev_output.vout as usize].clone());
             }
-            if !desc.is_witness() || force_non_witness_utxo {
+            if !desc.is_witness() || !only_witness_utxo {
                 psbt_input.non_witness_utxo = Some(prev_tx);
             }
         }
         Ok(psbt_input)
     }
 
-    fn add_input_hd_keypaths(&self, psbt: &mut PSBT) -> Result<(), Error> {
+    fn add_input_hd_keypaths(&self, psbt: &mut Psbt) -> Result<(), Error> {
         let mut input_utxos = Vec::with_capacity(psbt.inputs.len());
         for n in 0..psbt.inputs.len() {
             input_utxos.push(psbt.get_utxo_for(n).clone());
@@ -1492,7 +1506,7 @@ where
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use std::str::FromStr;
 
     use bitcoin::{util::psbt, Network};
@@ -2238,6 +2252,7 @@ mod test {
         let mut builder = wallet.build_tx();
         builder
             .set_single_recipient(addr.script_pubkey())
+            .only_witness_utxo()
             .drain_wallet();
         let (psbt, _) = builder.finish().unwrap();
 
@@ -2256,20 +2271,18 @@ mod test {
             .drain_wallet();
         let (psbt, _) = builder.finish().unwrap();
 
-        assert!(psbt.inputs[0].non_witness_utxo.is_none());
         assert!(psbt.inputs[0].witness_utxo.is_some());
     }
 
     #[test]
-    fn test_create_tx_both_non_witness_utxo_and_witness_utxo() {
+    fn test_create_tx_both_non_witness_utxo_and_witness_utxo_default() {
         let (wallet, _, _) =
             get_funded_wallet("wsh(pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW))");
         let addr = wallet.get_address(New).unwrap();
         let mut builder = wallet.build_tx();
         builder
             .set_single_recipient(addr.script_pubkey())
-            .drain_wallet()
-            .force_non_witness_utxo();
+            .drain_wallet();
         let (psbt, _) = builder.finish().unwrap();
 
         assert!(psbt.inputs[0].non_witness_utxo.is_some());
@@ -2407,6 +2420,7 @@ mod test {
         let (wallet1, _, _) = get_funded_wallet(get_test_wpkh());
         let (wallet2, _, _) =
             get_funded_wallet("wpkh(cVbZ8ovhye9AoAHFsqobCf7LxbXDAECy9Kb8TZdfsDYMZGBUyCnm)");
+
         let addr = Address::from_str("2N1Ffz3WaNzbeLFBb51xyFMHYSEUXcbiSoX").unwrap();
         let utxo = wallet2.list_unspent().unwrap().remove(0);
         let foreign_utxo_satisfaction = wallet2
@@ -2422,9 +2436,10 @@ mod test {
         let mut builder = wallet1.build_tx();
         builder
             .add_recipient(addr.script_pubkey(), 60_000)
+            .only_witness_utxo()
             .add_foreign_utxo(utxo.outpoint, psbt_input, foreign_utxo_satisfaction)
             .unwrap();
-        let (psbt, details) = builder.finish().unwrap();
+        let (mut psbt, details) = builder.finish().unwrap();
 
         assert_eq!(
             details.sent - details.received,
@@ -2441,14 +2456,30 @@ mod test {
             "foreign_utxo should be in there"
         );
 
-        let (psbt, finished) = wallet1.sign(psbt, None).unwrap();
+        let finished = wallet1
+            .sign(
+                &mut psbt,
+                SignOptions {
+                    trust_witness_utxo: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         assert!(
             !finished,
             "only one of the inputs should have been signed so far"
         );
 
-        let (_, finished) = wallet2.sign(psbt, None).unwrap();
+        let finished = wallet2
+            .sign(
+                &mut psbt,
+                SignOptions {
+                    trust_witness_utxo: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(finished, "all the inputs should have been signed now");
     }
 
@@ -2526,7 +2557,7 @@ mod test {
     }
 
     #[test]
-    fn test_add_foreign_utxo_force_non_witness_utxo() {
+    fn test_add_foreign_utxo_only_witness_utxo() {
         let (wallet1, _, _) = get_funded_wallet(get_test_wpkh());
         let (wallet2, _, txid2) =
             get_funded_wallet("wpkh(cVbZ8ovhye9AoAHFsqobCf7LxbXDAECy9Kb8TZdfsDYMZGBUyCnm)");
@@ -2539,9 +2570,7 @@ mod test {
             .unwrap();
 
         let mut builder = wallet1.build_tx();
-        builder
-            .add_recipient(addr.script_pubkey(), 60_000)
-            .force_non_witness_utxo();
+        builder.add_recipient(addr.script_pubkey(), 60_000);
 
         {
             let mut builder = builder.clone();
@@ -2555,6 +2584,22 @@ mod test {
             assert!(
                 builder.finish().is_err(),
                 "psbt_input with witness_utxo should fail with only witness_utxo"
+            );
+        }
+
+        {
+            let mut builder = builder.clone();
+            let psbt_input = psbt::Input {
+                witness_utxo: Some(utxo2.txout.clone()),
+                ..Default::default()
+            };
+            builder
+                .only_witness_utxo()
+                .add_foreign_utxo(utxo2.outpoint, psbt_input, satisfaction_weight)
+                .unwrap();
+            assert!(
+                builder.finish().is_ok(),
+                "psbt_input with just witness_utxo should succeed when `only_witness_utxo` is enabled"
             );
         }
 
@@ -2577,7 +2622,7 @@ mod test {
                 .unwrap();
             assert!(
                 builder.finish().is_ok(),
-                "psbt_input with non_witness_utxo should succeed with force_non_witness_utxo"
+                "psbt_input with non_witness_utxo should succeed by default"
             );
         }
     }
@@ -3467,12 +3512,12 @@ mod test {
         builder
             .set_single_recipient(addr.script_pubkey())
             .drain_wallet();
-        let (psbt, _) = builder.finish().unwrap();
+        let (mut psbt, _) = builder.finish().unwrap();
 
-        let (signed_psbt, finalized) = wallet.sign(psbt, None).unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
         assert_eq!(finalized, true);
 
-        let extracted = signed_psbt.extract_tx();
+        let extracted = psbt.extract_tx();
         assert_eq!(extracted.input[0].witness.len(), 2);
     }
 
@@ -3484,12 +3529,12 @@ mod test {
         builder
             .set_single_recipient(addr.script_pubkey())
             .drain_wallet();
-        let (psbt, _) = builder.finish().unwrap();
+        let (mut psbt, _) = builder.finish().unwrap();
 
-        let (signed_psbt, finalized) = wallet.sign(psbt, None).unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
         assert_eq!(finalized, true);
 
-        let extracted = signed_psbt.extract_tx();
+        let extracted = psbt.extract_tx();
         assert_eq!(extracted.input[0].witness.len(), 2);
     }
 
@@ -3501,12 +3546,12 @@ mod test {
         builder
             .set_single_recipient(addr.script_pubkey())
             .drain_wallet();
-        let (psbt, _) = builder.finish().unwrap();
+        let (mut psbt, _) = builder.finish().unwrap();
 
-        let (signed_psbt, finalized) = wallet.sign(psbt, None).unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
         assert_eq!(finalized, true);
 
-        let extracted = signed_psbt.extract_tx();
+        let extracted = psbt.extract_tx();
         assert_eq!(extracted.input[0].witness.len(), 2);
     }
 
@@ -3518,12 +3563,12 @@ mod test {
         builder
             .set_single_recipient(addr.script_pubkey())
             .drain_wallet();
-        let (psbt, _) = builder.finish().unwrap();
+        let (mut psbt, _) = builder.finish().unwrap();
 
-        let (signed_psbt, finalized) = wallet.sign(psbt, None).unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
         assert_eq!(finalized, true);
 
-        let extracted = signed_psbt.extract_tx();
+        let extracted = psbt.extract_tx();
         assert_eq!(extracted.input[0].witness.len(), 2);
     }
 
@@ -3536,12 +3581,12 @@ mod test {
         builder
             .set_single_recipient(addr.script_pubkey())
             .drain_wallet();
-        let (psbt, _) = builder.finish().unwrap();
+        let (mut psbt, _) = builder.finish().unwrap();
 
-        let (signed_psbt, finalized) = wallet.sign(psbt, None).unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
         assert_eq!(finalized, true);
 
-        let extracted = signed_psbt.extract_tx();
+        let extracted = psbt.extract_tx();
         assert_eq!(extracted.input[0].witness.len(), 2);
     }
 
@@ -3558,10 +3603,10 @@ mod test {
         psbt.inputs[0].bip32_derivation.clear();
         assert_eq!(psbt.inputs[0].bip32_derivation.len(), 0);
 
-        let (signed_psbt, finalized) = wallet.sign(psbt, None).unwrap();
+        let finalized = wallet.sign(&mut psbt, Default::default()).unwrap();
         assert_eq!(finalized, true);
 
-        let extracted = signed_psbt.extract_tx();
+        let extracted = psbt.extract_tx();
         assert_eq!(extracted.input[0].witness.len(), 2);
     }
 
@@ -3607,7 +3652,15 @@ mod test {
 
         psbt.inputs.push(dud_input);
         psbt.global.unsigned_tx.input.push(bitcoin::TxIn::default());
-        let (psbt, is_final) = wallet.sign(psbt, None).unwrap();
+        let is_final = wallet
+            .sign(
+                &mut psbt,
+                SignOptions {
+                    trust_witness_utxo: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             !is_final,
             "shouldn't be final since we can't sign one of the inputs"
