@@ -352,7 +352,7 @@ mod test {
             num_inp
         );
 
-        let _finalized = wallet.sign(
+        let finalized = wallet.sign(
             &mut psbt,
             SignOptions {
                 trust_witness_utxo: true,
@@ -364,6 +364,7 @@ mod test {
             .iter()
             .fold(0, |acc, i| acc + i.partial_sigs.len());
         assert_eq!(num_sigs, (num_inp - 0) * 1);
+        assert_eq!(finalized, false);
 
         let spendable = wallet.verify_proof(&psbt, &message)?;
         assert_eq!(spendable, balance);
@@ -469,10 +470,20 @@ mod test {
             num_inp
         );
 
+        // returns a tuple with the counts of (final_script_sig, final_script_sig, final_script_witness)
         let count_signatures = |psbt: &PSBT| {
-            psbt.inputs
-                .iter()
-                .fold(0, |acc, i| acc + i.partial_sigs.len())
+            psbt.inputs.iter().fold((0usize, 0, 0), |acc, i| {
+                (
+                    acc.0 + i.partial_sigs.len(),
+                    acc.1 + if i.final_script_sig.is_some() { 1 } else { 0 },
+                    acc.2
+                        + if i.final_script_witness.is_some() {
+                            1
+                        } else {
+                            0
+                        },
+                )
+            })
         };
 
         let signopts = SignOptions {
@@ -480,19 +491,19 @@ mod test {
             ..Default::default()
         };
         let finalized = wallet1.sign(&mut psbt, signopts.clone())?;
-        assert_eq!(count_signatures(&psbt), (num_inp - 0) * 1);
+        assert_eq!(count_signatures(&psbt), (num_inp * 1, 0, 0));
         assert_eq!(finalized, false);
 
         let finalized = wallet2.sign(&mut psbt, signopts.clone())?;
-        assert_eq!(count_signatures(&psbt), (num_inp - 0) * 2);
+        assert_eq!(count_signatures(&psbt), (num_inp * 2, num_inp - 1, num_inp - 1));
         assert_eq!(finalized, false);
 
         let finalized = wallet3.sign(&mut psbt, signopts.clone())?;
-        assert_eq!(count_signatures(&psbt), (num_inp - 0) * 3);
+        assert_eq!(count_signatures(&psbt), (num_inp * 2 + 1, num_inp - 1, num_inp - 1));
         assert_eq!(finalized, false);
 
         let finalized = wallet1.finalize_psbt(&mut psbt, signopts)?;
-        assert_eq!(count_signatures(&psbt), (num_inp - 0) * 3);
+        assert_eq!(count_signatures(&psbt), (num_inp * 2 + 1, num_inp - 1, num_inp - 1));
         if !finalized {
             write_to_temp_file(&psbt);
         }
