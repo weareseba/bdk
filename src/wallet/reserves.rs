@@ -470,7 +470,7 @@ mod test {
             num_inp
         );
 
-        // returns a tuple with the counts of (final_script_sig, final_script_sig, final_script_witness)
+        // returns a tuple with the counts of (partial_sigs, final_script_sig, final_script_witness)
         let count_signatures = |psbt: &PSBT| {
             psbt.inputs.iter().fold((0usize, 0, 0), |acc, i| {
                 (
