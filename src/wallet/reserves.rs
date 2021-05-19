@@ -34,7 +34,7 @@
 use bitcoin::{
     blockdata::{
         opcodes,
-        script::Builder,
+        script::{Builder, Script},
         transaction::{OutPoint, TxIn, TxOut},
     },
     consensus::encode::serialize,
@@ -47,7 +47,6 @@ use bitcoin::{
 };
 use bitcoin_hashes::{hash160, sha256d, Hash};
 use bitcoinconsensus;
-use std::convert::TryInto;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
@@ -85,8 +84,7 @@ where
                 value: 0,
                 script_pubkey: Builder::new().push_opcode(opcodes::OP_TRUE).into_script(),
             }),
-            witness_script: Some(Builder::new().into_script()),
-            final_script_sig: None,
+            final_script_sig: Some(Script::default()), // "finalize" the input with an empty scriptSig
             ..Default::default()
         };
 
@@ -130,7 +128,7 @@ pub fn verify_proof(
     outpoints: Vec<OutPoint>,
     network: Network,
 ) -> Result<u64, Error> {
-    let tx = &psbt.global.unsigned_tx;
+    let tx = psbt.clone().extract_tx();
 
     if tx.output.len() != 1 {
         return Err(Error::ProofOfReservesInvalid(format!(
@@ -195,7 +193,6 @@ pub fn verify_proof(
                     i,
                     &utxo.script_pubkey,
                     utxo.value,
-                    tx_in.previous_output.vout,
                 )
             } else if let Some(nwtx) = &psbt_in.non_witness_utxo {
                 let outp = &nwtx.output[tx_in.previous_output.vout as usize];
@@ -203,20 +200,19 @@ pub fn verify_proof(
                     i,
                     &outp.script_pubkey,
                     outp.value,
-                    tx_in.previous_output.vout,
                 )
             } else {
                 panic!("must be either witness or legacy");
             }
         })
-        .map(|(i, script, value, vout)| {
+        .map(|(i, script, value)| {
             (
                 i,
                 bitcoinconsensus::verify(
                     script.to_bytes().as_slice(),
                     value,
                     &serialized_tx,
-                    vout.try_into().unwrap(),
+                    i,
                 ),
             )
         })
@@ -307,7 +303,7 @@ mod test {
         let balance = client.script_get_balance(&address.script_pubkey()).unwrap();
 
         // redundant detailed verification start
-        let tx = &psbt.global.unsigned_tx;
+        let tx = psbt.clone().extract_tx();
 
         assert_eq!(tx.input.len(), 3);
         assert_eq!(tx.output.len(), 1);
@@ -363,8 +359,8 @@ mod test {
             .inputs
             .iter()
             .fold(0, |acc, i| acc + i.partial_sigs.len());
-        assert_eq!(num_sigs, (num_inp - 0) * 1);
-        assert_eq!(finalized, false);
+        assert_eq!(num_sigs, (num_inp - 1) * 1);
+        assert_eq!(finalized, true);
 
         let spendable = wallet.verify_proof(&psbt, &message)?;
         assert_eq!(spendable, balance);
@@ -491,23 +487,23 @@ mod test {
             ..Default::default()
         };
         let finalized = wallet1.sign(&mut psbt, signopts.clone())?;
-        assert_eq!(count_signatures(&psbt), (num_inp * 1, 0, 0));
+        assert_eq!(count_signatures(&psbt), ((num_inp - 1) * 1, 1, 0));
         assert_eq!(finalized, false);
 
         let finalized = wallet2.sign(&mut psbt, signopts.clone())?;
-        assert_eq!(count_signatures(&psbt), (num_inp * 2, num_inp - 1, num_inp - 1));
-        assert_eq!(finalized, false);
+        assert_eq!(count_signatures(&psbt), ((num_inp - 1) * 2, num_inp, num_inp - 1));
+        assert_eq!(finalized, true);
 
         let finalized = wallet3.sign(&mut psbt, signopts.clone())?;
-        assert_eq!(count_signatures(&psbt), (num_inp * 2 + 1, num_inp - 1, num_inp - 1));
-        assert_eq!(finalized, false);
+        assert_eq!(count_signatures(&psbt), ((num_inp - 1) * 2, num_inp, num_inp - 1));
+        assert_eq!(finalized, true);
 
         let finalized = wallet1.finalize_psbt(&mut psbt, signopts)?;
-        assert_eq!(count_signatures(&psbt), (num_inp * 2 + 1, num_inp - 1, num_inp - 1));
+        assert_eq!(count_signatures(&psbt), ((num_inp - 1) * 2, num_inp, num_inp - 1));
         if !finalized {
             write_to_temp_file(&psbt);
         }
-        assert_eq!(finalized, false);
+        assert_eq!(finalized, true);
 
         let spendable = wallet1.verify_proof(&psbt, &message)?;
         assert_eq!(spendable, balance);
