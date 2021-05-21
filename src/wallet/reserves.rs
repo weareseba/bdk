@@ -35,7 +35,7 @@ use bitcoin::{
     blockdata::{
         opcodes,
         script::{Builder, Script},
-        transaction::{OutPoint, TxIn, TxOut},
+        transaction::{OutPoint, SigHashType, TxIn, TxOut},
     },
     consensus::encode::serialize,
     hash_types::{PubkeyHash, Txid},
@@ -62,6 +62,10 @@ pub trait ProofOfReserves {
         self.do_create_proof(message)
     }
     /// Make sure this is a proof, and not a spendable transaction.
+    /// Make sure the proof is valid.
+    /// Currently proofs can only be validated against the tip of the chain.
+    /// If some of the UTXOs in the proof were spent in the meantime, the proof will fail.
+    /// We can currently not validate whether it was valid at a certain block height.
     /// Returns the spendable amount of the proof.
     fn verify_proof(&self, psbt: &PSBT, message: &str) -> Result<u64, Error> {
         self.do_verify_proof(psbt, message)
@@ -109,7 +113,6 @@ where
 
     fn do_verify_proof(&self, psbt: &PSBT, message: &str) -> Result<u64, Error> {
         // verify the proof UTXOs are still spendable
-        // ToDo: verify that the proof inputs were spendable at the block height of the proof
         let outpoints = self
             .list_unspent()?
             .iter()
@@ -121,6 +124,10 @@ where
 }
 
 /// Make sure this is a proof, and not a spendable transaction.
+/// Make sure the proof is valid.
+/// Currently proofs can only be validated against the tip of the chain.
+/// If some of the UTXOs in the proof were spent in the meantime, the proof will fail.
+/// We can currently not validate whether it was valid at a certain block height.
 /// Returns the spendable amount of the proof.
 pub fn verify_proof(
     psbt: &PSBT,
@@ -152,7 +159,6 @@ pub fn verify_proof(
     }
 
     // verify the proof UTXOs are still spendable
-    // ToDo: verify that the proof inputs were spendable at the block height of the proof
     if let Some(inp) = tx
         .input
         .iter()
@@ -166,12 +172,10 @@ pub fn verify_proof(
     }
 
     // verify that the inputs are signed, except the challenge
-    if let Some((i, inp)) = psbt
-        .inputs
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find(|(_i, inp)| inp.partial_sigs.len() == 0)
+    if let Some((i, inp)) =
+        psbt.inputs.iter().enumerate().skip(1).find(|(_i, inp)| {
+            !inp.final_script_sig.is_some() && !inp.final_script_witness.is_some()
+        })
     {
         return Err(Error::ProofOfReservesInvalid(format!(
             "Found an input that is not signed at #{} : {:?}",
@@ -179,8 +183,39 @@ pub fn verify_proof(
         )));
     }
 
+    // Make sure each input is either witness or legacy, but not both at the same time.
+    if let Some((i, _psbt_in)) =
+        psbt.inputs
+            .iter()
+            .enumerate()
+            .find(|(_i, psbt_in)| {
+                psbt_in.witness_utxo.is_some() && psbt_in.non_witness_utxo.is_some()
+            })
+    {
+        return Err(Error::ProofOfReservesInvalid(format!(
+            "Witness and legacy input found at input #{}",
+            i
+        )));
+    }
+
+    // Verify the SIGHASH
+    if let Some((i, _psbt_in)) =
+        psbt.inputs
+            .iter()
+            .enumerate()
+            .find(|(_i, psbt_in)| {
+                assert!(!psbt_in.sighash_type.is_some());    
+                // ToDo: find out what Alekos meant with validating the SIGHASH
+                false
+            })
+    {
+        return Err(Error::ProofOfReservesInvalid(format!(
+            "Witness and legacy input found at input #{}",
+            i
+        )));
+    }
+
     // Verify other inputs against prevouts and calculate the amount.
-    // ToDo: make sure this is enough to verify the signatures
     let serialized_tx = serialize(&tx);
     if let Some((i, res)) = psbt
         .inputs
@@ -189,18 +224,10 @@ pub fn verify_proof(
         .enumerate()
         .map(|(i, (psbt_in, tx_in))| {
             if let Some(utxo) = &psbt_in.witness_utxo {
-                (
-                    i,
-                    &utxo.script_pubkey,
-                    utxo.value,
-                )
+                (i, &utxo.script_pubkey, utxo.value)
             } else if let Some(nwtx) = &psbt_in.non_witness_utxo {
                 let outp = &nwtx.output[tx_in.previous_output.vout as usize];
-                (
-                    i,
-                    &outp.script_pubkey,
-                    outp.value,
-                )
+                (i, &outp.script_pubkey, outp.value)
             } else {
                 panic!("must be either witness or legacy");
             }
@@ -208,12 +235,7 @@ pub fn verify_proof(
         .map(|(i, script, value)| {
             (
                 i,
-                bitcoinconsensus::verify(
-                    script.to_bytes().as_slice(),
-                    value,
-                    &serialized_tx,
-                    i,
-                ),
+                bitcoinconsensus::verify(script.to_bytes().as_slice(), value, &serialized_tx, i),
             )
         })
         .find(|(_i, res)| res.is_err())
@@ -270,18 +292,14 @@ fn challenge_txin(message: &str) -> TxIn {
 #[cfg(test)]
 mod test {
     use bitcoin::{
-        consensus::{encode::Decodable, Encodable},
+        consensus::encode::Decodable,
         secp256k1::Secp256k1,
         util::key::{PrivateKey, PublicKey},
         util::psbt::PartiallySignedTransaction,
         Network,
     };
     use rstest::rstest;
-    use std::{
-        fs::{self, File},
-        io::Write,
-        str::FromStr,
-    };
+    use std::str::FromStr;
 
     use super::*;
     use crate::blockchain::{noop_progress, ElectrumBlockchain};
@@ -292,7 +310,7 @@ mod test {
 
     #[test]
     fn verify_existing_proof_testnet() {
-        let psbt = r#"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"#;
+        let psbt = r#"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"#;
         let psbt = base64::decode(psbt).unwrap();
         let psbt = PartiallySignedTransaction::consensus_decode(&psbt[..]).unwrap();
         let message = "SEBA Cold Storage 2021-04-01";
@@ -307,7 +325,7 @@ mod test {
 
         assert_eq!(tx.input.len(), 3);
         assert_eq!(tx.output.len(), 1);
-        assert_eq!(psbt.inputs[0].partial_sigs.len(), 3);
+        assert_eq!(psbt.inputs[0].partial_sigs.len(), 0);
         assert_eq!(psbt.inputs[1].partial_sigs.len(), 3);
         assert_eq!(psbt.inputs[2].partial_sigs.len(), 3);
 
@@ -364,6 +382,69 @@ mod test {
 
         let spendable = wallet.verify_proof(&psbt, &message)?;
         assert_eq!(spendable, balance);
+
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_proof_message() -> Result<(), Error> {
+        let descriptor = "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)";
+        let (wallet, _, _) = get_funded_wallet(descriptor);
+        let balance = wallet.get_balance()?;
+
+        let message_alice = "This belongs to Alice.";
+        let mut psbt_alice = wallet.create_proof(&message_alice)?;
+
+        let signopt = SignOptions {
+                trust_witness_utxo: true,
+                ..Default::default()
+            };
+        let _finalized = wallet.sign(&mut psbt_alice, signopt.clone())?;
+
+        let spendable = wallet.verify_proof(&psbt_alice, &message_alice)?;
+        assert_eq!(spendable, balance);
+
+        // change the message
+        let message_bob = "This belongs to Bob.";
+        let psbt_bob = wallet.create_proof(&message_bob)?;
+        psbt_alice.global.unsigned_tx.input[0].previous_output =
+            psbt_bob.global.unsigned_tx.input[0].previous_output;
+        psbt_alice.inputs[0].witness_utxo = psbt_bob.inputs[0].witness_utxo.clone();
+
+        assert!(wallet.verify_proof(&psbt_alice, &message_alice).is_err());
+        assert!(wallet.verify_proof(&psbt_alice, &message_bob).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_proof_witness_and_legacy() -> Result<(), Error> {
+        let descriptor = "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)";
+        let (wallet, _, _) = get_funded_wallet(descriptor);
+        let balance = wallet.get_balance()?;
+
+        let message = "This belongs to Alice.";
+        let mut psbt = wallet.create_proof(&message)?;
+
+        let signopt = SignOptions {
+                trust_witness_utxo: true,
+                ..Default::default()
+            };
+        let _finalized = wallet.sign(&mut psbt, signopt.clone())?;
+
+        let spendable = wallet.verify_proof(&psbt, &message)?;
+        assert_eq!(spendable, balance);
+
+        // add a legacy input to the existing segwit input
+        let descriptor_legacy = "pkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)";
+        let (wallet_legacy, _, _) = get_funded_wallet(descriptor_legacy);
+        let mut psbt_legacy = wallet_legacy.create_proof(&message)?;
+        let _finalized = wallet_legacy.sign(&mut psbt_legacy, signopt)?;
+
+        psbt.inputs[1].non_witness_utxo = psbt_legacy.inputs[1].non_witness_utxo.clone();
+
+
+        assert!(wallet.verify_proof(&psbt, &message).is_err());
 
         Ok(())
     }
@@ -491,43 +572,30 @@ mod test {
         assert_eq!(finalized, false);
 
         let finalized = wallet2.sign(&mut psbt, signopts.clone())?;
-        assert_eq!(count_signatures(&psbt), ((num_inp - 1) * 2, num_inp, num_inp - 1));
+        assert_eq!(
+            count_signatures(&psbt),
+            ((num_inp - 1) * 2, num_inp, num_inp - 1)
+        );
         assert_eq!(finalized, true);
 
+        // 2 signatures are enough. Just checking what happens...
         let finalized = wallet3.sign(&mut psbt, signopts.clone())?;
-        assert_eq!(count_signatures(&psbt), ((num_inp - 1) * 2, num_inp, num_inp - 1));
+        assert_eq!(
+            count_signatures(&psbt),
+            ((num_inp - 1) * 2, num_inp, num_inp - 1)
+        );
         assert_eq!(finalized, true);
 
         let finalized = wallet1.finalize_psbt(&mut psbt, signopts)?;
-        assert_eq!(count_signatures(&psbt), ((num_inp - 1) * 2, num_inp, num_inp - 1));
-        if !finalized {
-            write_to_temp_file(&psbt);
-        }
+        assert_eq!(
+            count_signatures(&psbt),
+            ((num_inp - 1) * 2, num_inp, num_inp - 1)
+        );
         assert_eq!(finalized, true);
 
         let spendable = wallet1.verify_proof(&psbt, &message)?;
         assert_eq!(spendable, balance);
 
         Ok(())
-    }
-
-    fn write_to_temp_file(psbt: &PSBT) {
-        let data = encode_tx(psbt).unwrap();
-        let filename = "/tmp/psbt";
-        #[allow(unused_must_use)]
-        fs::remove_file(filename);
-        let mut file = File::create(&filename).unwrap();
-        file.write_all(&data).unwrap();
-        file.sync_all().unwrap();
-    }
-
-    fn encode_tx(psbt: &PSBT) -> Result<Vec<u8>, Error> {
-        let mut encoded = Vec::<u8>::new();
-        if psbt.consensus_encode(&mut encoded).is_err() {
-            return Err(Error::CannotVerifyProof);
-        }
-        let tx = base64::encode(&encoded);
-
-        Ok(tx.as_bytes().to_vec())
     }
 }
