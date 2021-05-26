@@ -21,9 +21,6 @@ serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 rand = "^0.7"
 base64 = "^0.11"
-#bitcoinconsensus = "0.17.1"
-#bitcoinconsensus = "0.19.0-2"
-bitcoinconsensus = { git = "https://github.com/rust-bitcoin/rust-bitcoinconsensus", branch = "master" }
 
 # Optional dependencies
 sled = { version = "0.34", optional = true }
@@ -40,6 +37,7 @@ cc = { version = ">=1.0.64", optional = true }
 socks = { version = "0.3", optional = true }
 lazy_static = { version = "1.4", optional = true }
 tiny-bip39 = { version = "^0.8", optional = true }
+bitcoinconsensus = { git = "https://github.com/rust-bitcoin/rust-bitcoinconsensus", branch = "master", optional = true }
 
 # Platform-specific dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -62,6 +60,7 @@ cli-utils = ["clap"]
 async-interface = ["async-trait"]
 all-keys = ["keys-bip39"]
 keys-bip39 = ["tiny-bip39"]
+reserves = ["bitcoinconsensus"]
 
 # Debug/Test features
 debug-proc-macros = ["bdk-macros/debug", "bdk-testutils-macros/debug"]
