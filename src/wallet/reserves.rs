@@ -410,7 +410,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "ProofOfReservesInvalid(\"Unsupported sighash type")]
+    #[should_panic(expected = "Signer(NonStandardSighash)")]
     fn tampered_proof_sighash_tx() {
         let descriptor = "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)";
         let (wallet, _, _) = get_funded_wallet(descriptor);
