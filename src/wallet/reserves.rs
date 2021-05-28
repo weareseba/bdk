@@ -211,7 +211,7 @@ pub fn verify_proof(
         }
     }) {
         return Err(Error::ProofOfReservesInvalid(format!(
-            "unsupported sighash type at input #{}",
+            "Unsupported sighash type at input #{}",
             i
         )));
     }
@@ -293,55 +293,18 @@ fn challenge_txin(message: &str) -> TxIn {
 #[cfg(test)]
 mod test {
     use bitcoin::{
-        consensus::encode::Decodable,
         secp256k1::Secp256k1,
         util::key::{PrivateKey, PublicKey},
-        util::psbt::PartiallySignedTransaction,
         Network,
     };
     use rstest::rstest;
-    use std::str::FromStr;
 
     use super::*;
     use crate::blockchain::{noop_progress, ElectrumBlockchain};
     use crate::database::memory::MemoryDatabase;
-    use crate::electrum_client::{Client, ElectrumApi};
+    use crate::electrum_client::Client;
     use crate::wallet::test::get_funded_wallet;
     use crate::SignOptions;
-
-    #[test]
-    fn verify_existing_proof_testnet() {
-        let psbt = r#"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"#;
-        let psbt = base64::decode(psbt).unwrap();
-        let psbt = PartiallySignedTransaction::consensus_decode(&psbt[..]).unwrap();
-
-        // redundant detailed verification start
-        let tx = psbt.clone().extract_tx();
-        assert_eq!(tx.input.len(), 3);
-        assert_eq!(tx.output.len(), 1);
-        assert_eq!(psbt.inputs[0].partial_sigs.len(), 0);
-        assert_eq!(psbt.inputs[1].partial_sigs.len(), 3);
-        assert_eq!(psbt.inputs[2].partial_sigs.len(), 3);
-        // redundant detailed verification end
-
-        let client = Client::new("ssl://electrum.blockstream.info:60002").unwrap();
-        let address = bitcoin::Address::from_str("2Mtkk3kjyN8hgdGXPuJCNnwS3BBY4K2frhY").unwrap();
-        let unspents = client
-            .script_list_unspent(&address.script_pubkey())
-            .unwrap();
-        let outpoints: Vec<_> = unspents
-            .iter()
-            .map(|utxo| OutPoint {
-                txid: utxo.tx_hash,
-                vout: utxo.tx_pos as u32,
-            })
-            .collect();
-
-        let message = "Stored in SEBA Bank AG cold storage";
-        let balance = client.script_get_balance(&address.script_pubkey()).unwrap();
-        let spendable = verify_proof(&psbt, message, outpoints, Network::Testnet).unwrap();
-        assert_eq!(spendable, balance.confirmed + balance.unconfirmed as u64);
-    }
 
     #[rstest(
         descriptor,
@@ -444,6 +407,28 @@ mod test {
         psbt.inputs[1].non_witness_utxo = psbt_legacy.inputs[1].non_witness_utxo.clone();
 
         wallet.verify_proof(&psbt, &message).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "ProofOfReservesInvalid(\"Unsupported sighash type")]
+    fn tampered_proof_sighash_tx() {
+        let descriptor = "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)";
+        let (wallet, _, _) = get_funded_wallet(descriptor);
+
+        let message = "This belongs to Alice.";
+        let mut psbt = wallet.create_proof(&message).unwrap();
+
+        let signopt = SignOptions {
+            trust_witness_utxo: true,
+            ..Default::default()
+        };
+
+        // set an unsupported sighash
+        psbt.inputs[1].sighash_type = Some(SigHashType::Single);
+
+        let _finalized = wallet.sign(&mut psbt, signopt.clone()).unwrap();
+
+        let _spendable = wallet.verify_proof(&psbt, &message).unwrap();
     }
 
     enum MultisigType {
