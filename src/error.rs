@@ -16,7 +16,7 @@ use crate::{descriptor, wallet, wallet::address_validator};
 use bitcoin::OutPoint;
 
 /// Errors that can be thrown by the [`Wallet`](crate::wallet::Wallet)
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Error {
     /// Wrong number of bytes found when trying to convert to u32
     InvalidU32Bytes(Vec<u8>),
